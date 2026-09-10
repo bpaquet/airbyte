@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Airbyte, Inc., all rights reserved.
 #
 
+import logging
 import time
 from itertools import cycle
 from typing import Any, List, Mapping, Optional, Tuple
@@ -10,6 +11,8 @@ import jwt
 import requests
 
 from airbyte_cdk.sources.streams.http.requests_native_auth.abstract_token import AbstractHeaderAuthenticator
+
+logger = logging.getLogger("airbyte")
 
 # GitHub always issues installation access tokens valid for exactly 1 hour; refresh a bit early so
 # a token already handed to an in-flight request is never right at the edge of expiry.
@@ -49,6 +52,12 @@ class _InstallationTokenCache:
         response.raise_for_status()
         self._token = response.json()["token"]
         self._expires_at = time.time() + _INSTALLATION_TOKEN_LIFETIME_SECONDS - _REFRESH_MARGIN_SECONDS
+        logger.info(
+            "github_app_auth: minted installation token (app_id=%s, installation_id=%s, expires_at=%s)",
+            self._app_id,
+            self._installation_id,
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._expires_at)),
+        )
 
     def get_token(self) -> str:
         if self._token is None or time.time() >= self._expires_at:
