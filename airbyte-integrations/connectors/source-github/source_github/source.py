@@ -24,6 +24,7 @@ from airbyte_cdk.utils.traced_exception import AirbyteTracedException
 from source_github.utils import MultipleTokenAuthenticatorWithRateLimiter
 
 from . import constants
+from .github_app_auth import GithubAppMultiPemAuthenticator
 from .streams import (
     Assignees,
     Branches,
@@ -193,6 +194,8 @@ class SourceGithub(YamlDeclarativeSource, AbstractSource):
             return constants.PERSONAL_ACCESS_TOKEN_TITLE, config["access_token"]
 
         credentials = config.get("credentials", {})
+        if "github_apps" in credentials:
+            return constants.GITHUB_APP_TITLE, credentials["github_apps"]
         if "access_token" in credentials:
             return constants.ACCESS_TOKEN_TITLE, credentials["access_token"]
         if "personal_access_token" in credentials:
@@ -200,6 +203,9 @@ class SourceGithub(YamlDeclarativeSource, AbstractSource):
         raise Exception("Invalid config format")
 
     def _get_authenticator(self, config: Mapping[str, Any]):
+        credentials = config.get("credentials", {})
+        if "github_apps" in credentials:
+            return GithubAppMultiPemAuthenticator(github_apps=credentials["github_apps"])
         _, token = self.get_access_token(config)
         tokens = [t.strip() for t in token.split(constants.TOKEN_SEPARATOR)]
         return MultipleTokenAuthenticatorWithRateLimiter(tokens=tokens)

@@ -61,6 +61,24 @@
                 "airbyte_secret": true
               }
             }
+          },
+          {
+            "type": "object",
+            "title": "GitHub App(s)",
+            "required": ["github_apps"],
+            "properties": {
+              "option_title": {
+                "type": "string",
+                "const": "GitHub App Credentials",
+                "order": 0
+              },
+              "github_apps": {
+                "type": "string",
+                "title": "GitHub Apps",
+                "description": "One GitHub App installation per line: app_id:installation_id:private_key_base64 (the private key .pem file, base64-encoded onto a single line). Each installation's access token is minted and refreshed independently as needed, unlike a pasted access token it never goes stale mid-sync. Multiple lines round-robin for extra rate-limit headroom, the same idea as multiple comma-separated personal access tokens above.",
+                "airbyte_secret": true
+              }
+            }
           }
         ]
       },
