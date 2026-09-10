@@ -2,10 +2,9 @@
 # Copyright (c) 2026 Airbyte, Inc., all rights reserved.
 #
 
-import base64
 import time
 from itertools import cycle
-from typing import Any, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Tuple
 
 import jwt
 import requests
@@ -57,24 +56,54 @@ class _InstallationTokenCache:
         return self._token  # type: ignore[return-value]
 
 
-def _parse_entries(github_apps: str):
-    entries = []
-    for line in github_apps.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        app_id, installation_id, private_key_b64 = line.split(":", 2)
-        private_key = base64.b64decode(private_key_b64).decode()
-        entries.append((app_id, installation_id, private_key))
+def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
+    """Parses repeated {app_id line}\\n{installation_id line}\\n{PEM block} groups, blank lines
+    between groups allowed. The PEM block is taken verbatim from its `-----BEGIN` line through
+    its `-----END` line, so a real .pem file can be pasted as-is.
+    """
+    lines = github_apps.splitlines()
+    n = len(lines)
+    entries: List[Tuple[str, str, str]] = []
+    i = 0
+
+    def next_nonblank(i: int) -> int:
+        while i < n and not lines[i].strip():
+            i += 1
+        return i
+
+    while True:
+        i = next_nonblank(i)
+        if i >= n:
+            break
+        app_id = lines[i].strip()
+        i = next_nonblank(i + 1)
+        if i >= n:
+            raise ValueError(f"credentials.github_apps: missing installation_id after app_id '{app_id}'")
+        installation_id = lines[i].strip()
+        i = next_nonblank(i + 1)
+        if i >= n or not lines[i].strip().startswith("-----BEGIN"):
+            raise ValueError(f"credentials.github_apps: expected a '-----BEGIN...' PEM block after installation_id '{installation_id}'")
+        pem_lines = []
+        found_end = False
+        while i < n:
+            pem_lines.append(lines[i])
+            if lines[i].strip().startswith("-----END"):
+                i += 1
+                found_end = True
+                break
+            i += 1
+        if not found_end:
+            raise ValueError(f"credentials.github_apps: PEM block for app_id '{app_id}' never reached a '-----END...' line")
+        entries.append((app_id, installation_id, "\n".join(pem_lines)))
     return entries
 
 
 class GithubAppMultiPemAuthenticator(AbstractHeaderAuthenticator):
     """
     Authenticates as one or more GitHub App installations from a single config field
-    (`credentials.github_apps`): one entry per line, each formatted as
-    `app_id:installation_id:private_key_base64` (the private key .pem, base64-encoded onto a
-    single line so the whole thing fits a plain text field).
+    (`credentials.github_apps`): repeated groups of app_id line, installation_id line, then the
+    private key .pem pasted as-is (`-----BEGIN...` through `-----END...`) — repeat for more
+    installations, blank lines between groups are fine.
 
     Each entry gets its own installation-token cache, minted and refreshed independently and
     lazily — never all at once at startup — which is what lets a single sync outlive any one
@@ -87,9 +116,7 @@ class GithubAppMultiPemAuthenticator(AbstractHeaderAuthenticator):
         self._auth_header = auth_header
         entries = _parse_entries(github_apps)
         if not entries:
-            raise ValueError(
-                "credentials.github_apps must have at least one 'app_id:installation_id:private_key_base64' line"
-            )
+            raise ValueError("credentials.github_apps must have at least one app_id/installation_id/PEM group")
         self._caches = [_InstallationTokenCache(app_id, installation_id, private_key) for app_id, installation_id, private_key in entries]
         self._tokens_iter = cycle(range(len(self._caches)))
 
