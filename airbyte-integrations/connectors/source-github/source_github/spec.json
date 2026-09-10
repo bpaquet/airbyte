@@ -76,7 +76,8 @@
                 "type": "string",
                 "title": "GitHub Apps",
                 "description": "One or more GitHub App installations: app_id on its own line, then installation_id on the next line, then the private key .pem pasted as-is (from `-----BEGIN` to `-----END`). Repeat the 3 lines for more installations. Each installation's access token is minted and refreshed independently as needed, unlike a pasted access token it never goes stale mid-sync. Multiple installations round-robin for extra rate-limit headroom, the same idea as multiple comma-separated personal access tokens above.",
-                "airbyte_secret": true
+                "airbyte_secret": true,
+                "multiline": true
               }
             }
           }
