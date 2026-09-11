@@ -194,7 +194,10 @@ class SourceGithub(YamlDeclarativeSource, AbstractSource):
             return constants.PERSONAL_ACCESS_TOKEN_TITLE, config["access_token"]
 
         credentials = config.get("credentials", {})
-        if "github_apps" in credentials:
+        # `.get(...)` truthy check, not `in`: the UI can leave a stale empty `github_apps: ""`
+        # behind after switching the credentials oneOf away from "GitHub App(s)", which a bare
+        # presence check would wrongly treat as github_apps mode.
+        if credentials.get("github_apps"):
             return constants.GITHUB_APP_TITLE, credentials["github_apps"]
         if "access_token" in credentials:
             return constants.ACCESS_TOKEN_TITLE, credentials["access_token"]
@@ -204,7 +207,7 @@ class SourceGithub(YamlDeclarativeSource, AbstractSource):
 
     def _get_authenticator(self, config: Mapping[str, Any]):
         credentials = config.get("credentials", {})
-        if "github_apps" in credentials:
+        if credentials.get("github_apps"):
             return GithubAppMultiPemAuthenticator(github_apps=credentials["github_apps"])
         _, token = self.get_access_token(config)
         tokens = [t.strip() for t in token.split(constants.TOKEN_SEPARATOR)]
