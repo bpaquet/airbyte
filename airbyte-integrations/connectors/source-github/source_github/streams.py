@@ -84,8 +84,15 @@ class GithubStreamABC(HttpStream, ABC):
         if "next" in links:
             next_link = links["next"]["url"]
             parsed_link = parse.urlparse(next_link)
-            page = dict(parse.parse_qsl(parsed_link.query)).get("page")
-            return {"page": page}
+            # `page` breaks past GitHub's deep-pagination cutoff ("Pagination with the page
+            # parameter is not supported for large datasets"); the link header also carries the
+            # opaque `after` cursor, which has no such limit. parse_qsl decodes it, so unlike the
+            # manifest-side paginator there's no re-encoding step to double-encode it here.
+            query = dict(parse.parse_qsl(parsed_link.query))
+            after = query.get("after")
+            if after:
+                return {"after": after}
+            return {"page": query.get("page")}
 
     def request_params(
         self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None

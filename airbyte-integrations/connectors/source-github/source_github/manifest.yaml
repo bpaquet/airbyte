@@ -1421,8 +1421,8 @@ definitions:
   # --- Repo-scoped full-refresh REST streams --------------------------------------
   #
   # The streams below differ only in path, primary key and schema, so they share this
-  # retriever. Each is partitioned by `repository_partition_router`, and `page` pagination
-  # follows GitHub's `rel="next"` link header exactly as the legacy streams did.
+  # retriever. Each is partitioned by `repository_partition_router`, and pagination follows
+  # GitHub's `rel="next"` link header's `after` cursor (see `page_link_paginator` below).
   repository_scoped_retriever:
     type: SimpleRetriever
     record_selector:

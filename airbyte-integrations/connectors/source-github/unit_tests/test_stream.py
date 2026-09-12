@@ -873,6 +873,50 @@ def test_stream_pull_request_commits(requests_mock):
     ]
 
 
+def test_next_page_token_prefers_after_cursor_over_page(requests_mock):
+    """GithubStreamABC.next_page_token must follow the `after` cursor in the `link` header
+    instead of `page` when both are present, since `page` breaks past GitHub's deep-pagination
+    cutoff while `after` does not. This is the same fix already applied to the manifest-side
+    `page_link_paginator`, ported to the legacy Python streams still used as parent-stream
+    drivers for `issue_timeline_events`, `issue_comment_reactions` and `pull_request_commits`."""
+    repository_args = {
+        "repositories": ["organization/repository"],
+        "page_size_for_large_streams": 100,
+    }
+    repository_args_with_start_date = {**repository_args, "start_date": "2022-02-02T10:10:02Z"}
+    stream = PullRequestCommits(PullRequests(**repository_args_with_start_date), **repository_args)
+
+    requests_mock.get(
+        "https://api.github.com/repos/organization/repository/pulls",
+        [
+            {
+                "json": [{"id": 1, "updated_at": "2022-02-02T10:10:04Z", "number": 1}],
+                "headers": {
+                    # GitHub's real `link` header carries both `page` and `after` on the same
+                    # next-page URL; `after` must win.
+                    "Link": '<https://api.github.com/repos/organization/repository/pulls?page=2&after=cursor2>; rel="next"'
+                },
+            },
+            {"json": [{"id": 2, "updated_at": "2022-02-02T10:10:06Z", "number": 2}]},
+        ],
+    )
+    requests_mock.get(
+        "https://api.github.com/repos/organization/repository/pulls/1/commits",
+        json=[{"sha": 1}],
+    )
+    requests_mock.get(
+        "https://api.github.com/repos/organization/repository/pulls/2/commits",
+        json=[{"sha": 2}],
+    )
+
+    records = list(read_full_refresh(stream))
+    assert [record["sha"] for record in records] == [1, 2]
+
+    listings = [request for request in requests_mock.request_history if request.path.endswith("/pulls")]
+    assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
+    assert [request.qs.get("page") for request in listings] == [None, None]
+
+
 def test_stream_project_columns(requests_mock):
     repository_args_with_start_date = {
         "repositories": ["organization/repository"],
