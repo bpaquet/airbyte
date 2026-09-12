@@ -171,6 +171,30 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
 
 
+def test_pagination_cursor_is_not_double_encoded(rate_limit_mock_response, requests_mock):
+    """A percent-encoded `after` cursor from the link header must not be re-encoded again."""
+    config = _config("airbytehq/airbyte")
+    _mock_repository_resolution(requests_mock, "airbytehq/airbyte")
+    encoded_link = "https://api.github.com/repos/airbytehq/airbyte/tags?after=Y3Vyc29yOnYyOpLPAAABZ4myxjDOFyvFzA%3D%3D"
+    requests_mock.get(
+        "https://api.github.com/repos/airbytehq/airbyte/tags",
+        [
+            {"json": [{"name": "v1"}], "headers": _next_link(encoded_link)},
+            {"json": [{"name": "v2"}]},
+        ],
+    )
+
+    records, _, error = _read(config, "tags")
+
+    assert error is None
+    assert [record["name"] for record in records] == ["v1", "v2"]
+    listings = [request for request in requests_mock.request_history if request.path.endswith("/tags")]
+    # requests_mock's `request.qs` lowercases captured values, so compare case-insensitively;
+    # what matters is it's the clean base64 cursor once, never the mangled double-escaped form.
+    expected_cursor = "Y3Vyc29yOnYyOpLPAAABZ4myxjDOFyvFzA=="
+    assert [request.qs.get("after") for request in listings] == [None, [expected_cursor.lower()]]
+
+
 @pytest.mark.parametrize(
     ("status_code", "body", "expected_log"),
     [

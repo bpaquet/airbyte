@@ -563,8 +563,17 @@ definitions:
       # re-evaluates the same failing expression and the error escapes, failing the sync.
       # On the last page there is no `next` link, so `regex_search` gets "" and returns None;
       # CursorPaginationStrategy ends on `token if token else None`, so pagination stops.
+      #
+      # regex_search returns the cursor still percent-encoded (from the link header), and the
+      # requester re-encodes it, double-encoding it. No urldecode filter exists, so undo the
+      # percent-encoding of base64's own special chars (=, +, /) by hand.
       type: CursorPagination
-      cursor_value: '{{ headers.get("link", {}).get("next", {}).get("url", "") | regex_search("[?&]after=([^&]+)") }}'
+      cursor_value: >-
+        {{ headers.get("link", {}).get("next", {}).get("url", "")
+           | regex_search("[?&]after=([^&]+)")
+           | regex_replace("%3[Dd]", "=")
+           | regex_replace("%2[Bb]", "+")
+           | regex_replace("%2[Ff]", "/") }}
 
   # Resolver streams: internal parent streams used only to drive the shared
   # partition routers below. They are not exposed in the catalog.
