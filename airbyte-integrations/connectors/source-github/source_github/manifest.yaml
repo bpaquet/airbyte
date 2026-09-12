@@ -23,7 +23,11 @@ definitions:
     {{ (config.get('repositories', []) | map('regex_search', '^(.*[*].*)$') | select | list | length) == 0
        or record['full_name'] | regex_search('^((' ~ (config.get('repositories', []) | map('regex_search', '^(.*[*].*)$') | select | map('replace', '*', '.*') | join(')|(')) ~ '))') }}
 
-  large_stream_page_size: "{{ config.get('page_size_for_large_streams') or 10 }}"
+  # GitHub's REST API max. Was 10: at that size, a repository with enough history in a "large
+  # stream" (issues, comments, ...) reaches enough pages to hit GitHub's page-depth cutoff
+  # ("Pagination with the page parameter is not supported for large datasets"), failing the sync
+  # outright. 100 cuts the page count (and the odds of hitting that cutoff) by 10x.
+  large_stream_page_size: "{{ config.get('page_size_for_large_streams') or 100 }}"
 
   requester_base:
     type: HttpRequester

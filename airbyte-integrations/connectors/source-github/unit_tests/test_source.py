@@ -280,7 +280,6 @@ def test_streams_page_size(rate_limit_mock_response, requests_mock):
 
     source = SourceGithub()
     streams = source.streams(config)
-    assert constants.DEFAULT_PAGE_SIZE != constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM
 
     for stream in streams:
         if not hasattr(stream, "page_size"):
