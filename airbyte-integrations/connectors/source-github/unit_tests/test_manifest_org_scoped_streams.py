@@ -164,7 +164,7 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
         [
             {
                 "json": [{"id": 1, "login": "first"}],
-                "headers": {"Link": '<https://api.github.com/orgs/airbytehq/members?page=2>; rel="next"'},
+                "headers": {"Link": '<https://api.github.com/orgs/airbytehq/members?after=cursor2>; rel="next"'},
             },
             {"json": [{"id": 2, "login": "second"}]},
         ],

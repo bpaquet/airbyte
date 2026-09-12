@@ -158,7 +158,7 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     requests_mock.get(
         "https://api.github.com/repos/airbytehq/airbyte/tags",
         [
-            {"json": [{"name": "v1"}], "headers": _next_link("https://api.github.com/repos/airbytehq/airbyte/tags?page=2")},
+            {"json": [{"name": "v1"}], "headers": _next_link("https://api.github.com/repos/airbytehq/airbyte/tags?after=cursor2")},
             {"json": [{"name": "v2"}]},
         ],
     )
@@ -168,7 +168,7 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     assert error is None
     assert [record["name"] for record in records] == ["v1", "v2"]
     listings = [request for request in requests_mock.request_history if request.path.endswith("/tags")]
-    assert [request.qs.get("page") for request in listings] == [None, ["2"]]
+    assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
 
 
 @pytest.mark.parametrize(

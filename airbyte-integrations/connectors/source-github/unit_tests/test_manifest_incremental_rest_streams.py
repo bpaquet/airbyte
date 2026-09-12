@@ -259,9 +259,11 @@ def test_page_size_comes_from_page_size_for_large_streams(stream_name, endpoint,
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
-def test_page_size_defaults_to_ten(stream_name, endpoint, rate_limit_mock_response, requests_mock):
-    """`constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM`. A present-but-null value must fall back
-    to it as well rather than reaching GitHub as `per_page=None`."""
+def test_page_size_defaults_to_hundred(stream_name, endpoint, rate_limit_mock_response, requests_mock):
+    """`constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` (100, GitHub's REST max — was 10, which hit
+    GitHub's undocumented deep-pagination cutoff on repositories with enough history). A
+    present-but-null value must fall back to it as well rather than reaching GitHub as
+    `per_page=None`."""
     config = _config("docker/compose", page_size_for_large_streams=None)
     _mock_repository_resolution(requests_mock, "docker/compose")
     requests_mock.get(f"https://api.github.com/repos/docker/compose/{endpoint}", json=[])
@@ -269,7 +271,7 @@ def test_page_size_defaults_to_ten(stream_name, endpoint, rate_limit_mock_respon
     _, _, _, error = _read(config, stream_name)
 
     assert error is None
-    assert [request.qs["per_page"] for request in _listings(requests_mock, endpoint)] == [["10"]]
+    assert [request.qs["per_page"] for request in _listings(requests_mock, endpoint)] == [["100"]]
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
@@ -283,7 +285,7 @@ def test_pagination_follows_link_header(stream_name, endpoint, rate_limit_mock_r
         [
             {
                 "json": [{"id": 1, "updated_at": "2022-03-01T00:00:00Z"}],
-                "headers": _next_link(f"https://api.github.com/repos/docker/compose/{endpoint}?page=2"),
+                "headers": _next_link(f"https://api.github.com/repos/docker/compose/{endpoint}?after=cursor2"),
             },
             {"json": [{"id": 2, "updated_at": "2022-03-02T00:00:00Z"}]},
         ],
@@ -294,7 +296,7 @@ def test_pagination_follows_link_header(stream_name, endpoint, rate_limit_mock_r
     assert error is None
     assert [record["id"] for record in records] == [1, 2]
     listings = _listings(requests_mock, endpoint)
-    assert [request.qs.get("page") for request in listings] == [None, ["2"]]
+    assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
     assert all(request.qs["since"] == [_START_DATE.lower()] for request in listings)
 
 
@@ -506,9 +508,11 @@ def test_comments_two_sync_parity_with_legacy(rate_limit_mock_response, requests
         requests_mock.get(f"{url}?per_page=2&since={_START_DATE}", json=records[0:2])
         # Second sync: `since` is the cursor the first sync stored, and the listing is three
         # linked pages. GitHub's `since` is inclusive, so the boundary record comes back.
-        requests_mock.get(f"{url}?per_page=2&since={second_sync_since}", json=records[1:3], headers=_next_link(f"{url}?page=2"))
-        requests_mock.get(f"{url}?per_page=2&page=2&since={second_sync_since}", json=records[3:5], headers=_next_link(f"{url}?page=3"))
-        requests_mock.get(f"{url}?per_page=2&page=3&since={second_sync_since}", json=records[5:])
+        requests_mock.get(f"{url}?per_page=2&since={second_sync_since}", json=records[1:3], headers=_next_link(f"{url}?after=cursor2"))
+        requests_mock.get(
+            f"{url}?per_page=2&after=cursor2&since={second_sync_since}", json=records[3:5], headers=_next_link(f"{url}?after=cursor3")
+        )
+        requests_mock.get(f"{url}?per_page=2&after=cursor3&since={second_sync_since}", json=records[5:])
 
     records, statuses, states, error = _read(config, "comments")
 

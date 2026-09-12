@@ -117,13 +117,15 @@ class EventsTest(TestCase):
             HttpResponse(
                 body=json.dumps(find_template("events", __file__)),
                 status_code=200,
-                headers={"Link": '<https://api.github.com/repos/{}/events?page=2>; rel="next"'.format(_CONFIG.get("repositories")[0])},
+                headers={
+                    "Link": '<https://api.github.com/repos/{}/events?after=cursor2>; rel="next"'.format(_CONFIG.get("repositories")[0])
+                },
             ),
         )
         self.r_mock.get(
             HttpRequest(
                 url=f"https://api.github.com/repos/{_CONFIG.get('repositories')[0]}/events",
-                query_params={"per_page": 100, "page": 2},
+                query_params={"per_page": 100, "after": "cursor2"},
             ),
             HttpResponse(
                 body=json.dumps(find_template("events", __file__)),

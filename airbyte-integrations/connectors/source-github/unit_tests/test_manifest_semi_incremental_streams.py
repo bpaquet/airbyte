@@ -55,8 +55,6 @@ STREAM_PARAMS = [pytest.param(*stream, id=stream[0]) for stream in MIGRATED_STRE
 DATA_FEED_STREAMS = {"pull_requests", "issue_milestones"}
 CLIENT_SIDE_PARAMS = [pytest.param(*stream, id=stream[0]) for stream in MIGRATED_STREAMS if stream[0] not in DATA_FEED_STREAMS]
 DATA_FEED_PARAMS = [pytest.param(*stream, id=stream[0]) for stream in MIGRATED_STREAMS if stream[0] in DATA_FEED_STREAMS]
-# `GithubStream.large_stream`: `per_page` comes from `page_size_for_large_streams` (default 10) rather than 100.
-LARGE_STREAMS = {"pull_requests"}
 EXTRA_ACCEPT_HEADERS = {
     "stargazers": "application/vnd.github.v3.star+json",
     "projects": "application/vnd.github.inertia-preview+json",
@@ -222,7 +220,7 @@ def test_request_shape_matches_legacy(stream_name, endpoint, cursor_field, param
     assert error is None
     (request,) = _listings(requests_mock, endpoint)
     assert request.path == f"/repos/docker/compose/{endpoint}"
-    per_page = "10" if stream_name in LARGE_STREAMS else "100"
+    per_page = "100"  # DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM == DEFAULT_PAGE_SIZE now, both GitHub's REST max
     assert request.qs == {"per_page": [per_page], **{key: [value] for key, value in params.items()}}
     # Without `User-Agent` GitHub answers 403; a stream that adds an `Accept` must restate it.
     assert request.headers["User-Agent"] == "PostmanRuntime/7.28.0"
@@ -342,7 +340,7 @@ def test_unsorted_streams_read_every_page(stream_name, endpoint, cursor_field, p
                     stream_name,
                     [_record(stream_name, 1, cursor_field, _BEFORE_START), _record(stream_name, 2, cursor_field, _BEFORE_START)],
                 ),
-                "headers": _next_link(f"{url}?page=2"),
+                "headers": _next_link(f"{url}?after=cursor2"),
             },
             {"json": _body(stream_name, [_record(stream_name, 3, cursor_field, _AFTER_START)])},
         ],
@@ -353,7 +351,7 @@ def test_unsorted_streams_read_every_page(stream_name, endpoint, cursor_field, p
     assert error is None
     assert statuses[-1] == "COMPLETE"
     assert _ids(stream_name, records) == [3]
-    assert [request.qs.get("page") for request in _listings(requests_mock, endpoint)] == [None, ["2"]]
+    assert [request.qs.get("after") for request in _listings(requests_mock, endpoint)] == [None, ["cursor2"]]
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint", "cursor_field", "params"), DATA_FEED_PARAMS)
@@ -380,7 +378,7 @@ def test_sorted_streams_stop_paginating_at_the_first_stale_record(
                         _record(stream_name, 1, cursor_field, _BEFORE_START),
                     ],
                 ),
-                "headers": _next_link(f"{url}?page=2"),
+                "headers": _next_link(f"{url}?after=cursor2"),
             },
             {"json": _body(stream_name, [_record(stream_name, 0, cursor_field, _BEFORE_START)])},
         ],
@@ -410,7 +408,7 @@ def test_sorted_streams_keep_paginating_past_a_boundary_record(
                 "json": _body(
                     stream_name, [_record(stream_name, 2, cursor_field, _LATER), _record(stream_name, 1, cursor_field, _AFTER_START)]
                 ),
-                "headers": _next_link(f"{url}?page=2"),
+                "headers": _next_link(f"{url}?after=cursor2"),
             },
             {"json": _body(stream_name, [_record(stream_name, 0, cursor_field, _BEFORE_START)])},
         ],
@@ -484,9 +482,9 @@ def test_pull_requests_flatten_head_and_base_repositories(rate_limit_mock_respon
 @pytest.mark.parametrize(
     ("page_size_config", "expected_per_page"),
     [
-        pytest.param({}, "10", id="default_is_the_large_stream_page_size"),
+        pytest.param({}, "100", id="default_is_the_large_stream_page_size"),
         pytest.param({"page_size_for_large_streams": 3}, "3", id="configured"),
-        pytest.param({"page_size_for_large_streams": None}, "10", id="present_but_null_falls_back"),
+        pytest.param({"page_size_for_large_streams": None}, "100", id="present_but_null_falls_back"),
     ],
 )
 def test_pull_requests_page_size_comes_from_the_large_stream_setting(

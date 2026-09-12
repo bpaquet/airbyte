@@ -493,7 +493,7 @@ def test_resolution_legacy_repository_field(requests_mock):
 
 
 def _next_link(page):
-    return {"Link": f'<https://api.github.com/orgs/org/repos?page={page}>; rel="next"'}
+    return {"Link": f'<https://api.github.com/orgs/org/repos?after=cursor{page}>; rel="next"'}
 
 
 def test_resolution_pagination(requests_mock):

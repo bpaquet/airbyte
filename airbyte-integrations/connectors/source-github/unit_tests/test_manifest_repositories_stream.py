@@ -493,7 +493,7 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     requests_mock.get(
         "https://api.github.com/orgs/docker/repos",
         [
-            {"json": page1, "headers": _next_link("https://api.github.com/orgs/docker/repos?page=2")},
+            {"json": page1, "headers": _next_link("https://api.github.com/orgs/docker/repos?after=cursor2")},
             {"json": [_repo(200, "docker/last")]},
         ],
     )
@@ -504,7 +504,7 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     assert len(records) == 101
     assert "docker/last" in _names(records)
     listings = [request for request in requests_mock.request_history if request.path == "/orgs/docker/repos"]
-    assert [request.qs.get("page") for request in listings] == [None, ["2"]]
+    assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
 
 
 def test_short_page_with_next_link_is_followed(rate_limit_mock_response, requests_mock):
@@ -515,7 +515,7 @@ def test_short_page_with_next_link_is_followed(rate_limit_mock_response, request
     requests_mock.get(
         "https://api.github.com/orgs/docker/repos",
         [
-            {"json": [_repo(1, "docker/a")], "headers": _next_link("https://api.github.com/orgs/docker/repos?page=2")},
+            {"json": [_repo(1, "docker/a")], "headers": _next_link("https://api.github.com/orgs/docker/repos?after=cursor2")},
             {"json": [_repo(2, "docker/b")]},
         ],
     )
@@ -576,7 +576,7 @@ def test_pagination_stops_at_cursor(rate_limit_mock_response, requests_mock):
     requests_mock.get(
         "https://api.github.com/orgs/docker/repos",
         [
-            {"json": stale_page, "headers": _next_link("https://api.github.com/orgs/docker/repos?page=2")},
+            {"json": stale_page, "headers": _next_link("https://api.github.com/orgs/docker/repos?after=cursor2")},
             {"json": [_repo(200, "docker/last", updated_at="2024-01-01T00:00:00Z")]},
         ],
     )
