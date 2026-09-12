@@ -538,7 +538,17 @@ definitions:
     page_token_option:
       type: RequestOption
       inject_into: request_parameter
-      field_name: "page"
+      # GitHub's own `link: rel="next"` already carries an opaque `after` cursor alongside
+      # `page`, and once page*per_page crosses GitHub's undocumented deep-pagination cutoff
+      # (~10,000), requesting that same `page` value 422s ("Pagination with the page parameter
+      # is not supported for large datasets, please use cursor based pagination (after/before)")
+      # — even though GitHub itself just offered it. `after` alone (no `page` at all) works at
+      # any depth, confirmed live against a large repository. `field_name`/`cursor_value` must
+      # agree on the same param, so this only extracts `after`, not `page` — a GitHub Enterprise
+      # Server instance whose `next` link doesn't carry an `after` cursor would have its
+      # pagination stop after the first page instead. No known GHES user of this fork yet;
+      # revisit with a custom requester if that changes.
+      field_name: "after"
     pagination_strategy:
       # GitHub's documented end-of-data signal is the absence of a `rel="next"` link
       # header — a short page is not guaranteed to be the last page. This mirrors the
@@ -554,7 +564,7 @@ definitions:
       # On the last page there is no `next` link, so `regex_search` gets "" and returns None;
       # CursorPaginationStrategy ends on `token if token else None`, so pagination stops.
       type: CursorPagination
-      cursor_value: '{{ headers.get("link", {}).get("next", {}).get("url", "") | regex_search("[?&]page=([0-9]+)") }}'
+      cursor_value: '{{ headers.get("link", {}).get("next", {}).get("url", "") | regex_search("[?&]after=([^&]+)") }}'
 
   # Resolver streams: internal parent streams used only to drive the shared
   # partition routers below. They are not exposed in the catalog.
