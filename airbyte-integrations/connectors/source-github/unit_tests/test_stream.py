@@ -694,6 +694,31 @@ def test_stream_pull_requests_incremental_read(requests_mock):
     assert stream_state == {"organization/repository": {"updated_at": "2022-02-02T10:10:12Z"}}
 
 
+def test_next_page_token_prefers_after_cursor_over_page():
+    """GitHub's own `next` link carries both `page` and an opaque `after` cursor. Requesting
+    with `page` alone eventually 422s ("Pagination with the page parameter is not supported for
+    large datasets") once `page * per_page` crosses GitHub's undocumented deep-pagination cutoff
+    (~10,000), even though GitHub's own link offered that exact `page` value. `after` alone (no
+    `page` at all) works at any depth, so it must be preferred whenever present.
+    """
+    stream = PullRequests(repositories=["organization/repository"], page_size_for_large_streams=100, start_date="2022-02-02T10:10:03Z")
+    response = requests.Response()
+    response.headers["Link"] = (
+        '<https://api.github.com/repos/organization/repository/pulls?per_page=100&page=100&after=Y3Vyc29yOnYyOpE>; rel="next"'
+    )
+    assert stream.next_page_token(response) == {"after": "Y3Vyc29yOnYyOpE"}
+
+
+def test_next_page_token_falls_back_to_page_without_after_cursor():
+    """A `next` link with no `after` cursor (e.g. GitHub Enterprise Server, which may not offer
+    one) falls back to the legacy `page` param — the only pagination mechanism it may support.
+    """
+    stream = PullRequests(repositories=["organization/repository"], page_size_for_large_streams=100, start_date="2022-02-02T10:10:03Z")
+    response = requests.Response()
+    response.headers["Link"] = '<https://github.example.com/api/v3/repos/organization/repository/pulls?per_page=100&page=2>; rel="next"'
+    assert stream.next_page_token(response) == {"page": "2"}
+
+
 def test_stream_commits_incremental_read(requests_mock):
     repository_args_with_start_date = {
         "repositories": ["organization/repository"],

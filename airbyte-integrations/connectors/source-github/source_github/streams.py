@@ -80,9 +80,18 @@ class GithubStreamABC(HttpStream, ABC):
         links = response.links
         if "next" in links:
             next_link = links["next"]["url"]
-            parsed_link = parse.urlparse(next_link)
-            page = dict(parse.parse_qsl(parsed_link.query)).get("page")
-            return {"page": page}
+            query = dict(parse.parse_qsl(parse.urlparse(next_link).query))
+            # GitHub's own `link: rel="next"` already carries an opaque `after` cursor
+            # alongside `page`, and once `page * per_page` crosses GitHub's undocumented
+            # deep-pagination cutoff (~10,000), requesting that same `page` value 422s with
+            # "Pagination with the page parameter is not supported for large datasets, please
+            # use cursor based pagination (after/before)" — even though GitHub itself just
+            # offered it. `after` alone (no `page` at all) works at any depth, so prefer it.
+            # Falls back to `page` for API URLs (e.g. GitHub Enterprise Server) whose `next`
+            # link doesn't carry an `after` cursor.
+            if query.get("after"):
+                return {"after": query["after"]}
+            return {"page": query.get("page")}
 
     def request_params(
         self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None
