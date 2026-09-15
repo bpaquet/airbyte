@@ -8,7 +8,7 @@ import struct
 import time
 from abc import ABC, abstractmethod
 from datetime import timedelta
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Union
+from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 from urllib import parse
 
 import requests
@@ -117,14 +117,32 @@ class GithubStreamABC(HttpStream, ABC):
     # through hundreds of thousands of records.
     _last_rate_limit_log_at: float = 0.0
 
+    def _active_github_app_identity(self) -> Tuple[Optional[str], Optional[str]]:
+        """Best-effort peek at which app_id/installation_id the shared authenticator is
+        actually using right now, straight from its private state - only meaningful in
+        github_apps auth mode; returns (None, None) otherwise or if internals shift."""
+        try:
+            authenticator = self._http_client._session.auth
+            caches = getattr(authenticator, "_caches", None)
+            active_index = getattr(authenticator, "_active_index", None)
+            if not caches or active_index is None or not (0 <= active_index < len(caches)):
+                return None, None
+            active_cache = caches[active_index]
+            return getattr(active_cache, "_app_id", None), getattr(active_cache, "_installation_id", None)
+        except Exception:
+            return None, None
+
     def _log_rate_limit_probe(self, response: requests.Response) -> None:
         now = time.time()
         if now - GithubStreamABC._last_rate_limit_log_at < 30:
             return
         GithubStreamABC._last_rate_limit_log_at = now
+        app_id, installation_id = self._active_github_app_identity()
         self.logger.info(
-            "github_rate_limit_probe: stream=%s url=%s remaining=%s limit=%s used=%s reset=%s",
+            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s url=%s remaining=%s limit=%s used=%s reset=%s",
             self.name,
+            app_id,
+            installation_id,
             response.url,
             response.headers.get("X-RateLimit-Remaining"),
             response.headers.get("X-RateLimit-Limit"),
