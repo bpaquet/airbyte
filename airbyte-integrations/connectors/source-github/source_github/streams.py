@@ -4,6 +4,7 @@
 
 import base64
 import binascii
+import hashlib
 import struct
 import time
 from abc import ABC, abstractmethod
@@ -142,16 +143,21 @@ class GithubStreamABC(HttpStream, ABC):
         # TYPE prefix only (`token ghs_` = installation token, `ghp_`/`github_pat_` = PAT,
         # `ghu_` = user-to-server, `Bearer eyJ` = app JWT) - never the secret itself.
         sent_auth = response.request.headers.get("Authorization", "") if response.request is not None else ""
+        # sha256 prefix of the bare token, so it can be matched against a token recovered
+        # elsewhere (`echo -n "$T" | sha256sum | cut -c1-8`) without ever logging the secret.
+        sent_token_fp = hashlib.sha256(sent_auth.split(" ", 1)[-1].encode()).hexdigest()[:8] if sent_auth else None
         self.logger.info(
-            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s sent_auth_prefix=%r x_oauth_scopes=%r "
-            "resource=%s request_id=%s url=%s remaining=%s limit=%s used=%s reset=%s",
+            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s sent_auth_prefix=%r sent_token_fp=%s "
+            "x_oauth_scopes=%r resource=%s request_id=%s edge=%s url=%s remaining=%s limit=%s used=%s reset=%s",
             self.name,
             app_id,
             installation_id,
             sent_auth[:10],
+            sent_token_fp,
             response.headers.get("X-OAuth-Scopes"),
             response.headers.get("X-RateLimit-Resource"),
             response.headers.get("X-GitHub-Request-Id"),
+            response.headers.get("x-github-edge-region"),
             response.url,
             response.headers.get("X-RateLimit-Remaining"),
             response.headers.get("X-RateLimit-Limit"),
