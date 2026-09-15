@@ -138,11 +138,20 @@ class GithubStreamABC(HttpStream, ABC):
             return
         GithubStreamABC._last_rate_limit_log_at = now
         app_id, installation_id = self._active_github_app_identity()
+        # What actually went on the wire, not what the authenticator object believes: the token
+        # TYPE prefix only (`token ghs_` = installation token, `ghp_`/`github_pat_` = PAT,
+        # `ghu_` = user-to-server, `Bearer eyJ` = app JWT) - never the secret itself.
+        sent_auth = response.request.headers.get("Authorization", "") if response.request is not None else ""
         self.logger.info(
-            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s url=%s remaining=%s limit=%s used=%s reset=%s",
+            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s sent_auth_prefix=%r x_oauth_scopes=%r "
+            "resource=%s request_id=%s url=%s remaining=%s limit=%s used=%s reset=%s",
             self.name,
             app_id,
             installation_id,
+            sent_auth[:10],
+            response.headers.get("X-OAuth-Scopes"),
+            response.headers.get("X-RateLimit-Resource"),
+            response.headers.get("X-GitHub-Request-Id"),
             response.url,
             response.headers.get("X-RateLimit-Remaining"),
             response.headers.get("X-RateLimit-Limit"),
