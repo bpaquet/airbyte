@@ -4,7 +4,6 @@
 
 import base64
 import binascii
-import hashlib
 import struct
 import time
 from abc import ABC, abstractmethod
@@ -112,16 +111,16 @@ class GithubStreamABC(HttpStream, ABC):
         # Without sending `User-Agent` header we will be getting `403 Client Error: Forbidden for url` error.
         return {"User-Agent": "PostmanRuntime/7.28.0"}
 
-    # TEMPORARY diagnostic (remove once the rate-limit-quota investigation is closed): a
-    # class-level (shared across every stream instance) timestamp gate so this logs at most
-    # once per 30s total, instead of once per page/response — some of these streams paginate
-    # through hundreds of thousands of records.
+    # The `X-RateLimit-*` headers on the connector's own responses are the only reading of the
+    # quota that is guaranteed to be the one its requests actually consume: `/rate_limit` and
+    # other external probes were observed reporting a different counter for the same
+    # installation. Logged at most once per 30s across all stream instances (class-level gate)
+    # so streams paginating through hundreds of thousands of records don't flood the log.
     _last_rate_limit_log_at: float = 0.0
 
     def _active_github_app_identity(self) -> Tuple[Optional[str], Optional[str]]:
-        """Best-effort peek at which app_id/installation_id the shared authenticator is
-        actually using right now, straight from its private state - only meaningful in
-        github_apps auth mode; returns (None, None) otherwise or if internals shift."""
+        """Which app_id/installation_id the shared authenticator is currently using, read from
+        its private state; (None, None) outside github_apps auth mode or if internals shift."""
         try:
             authenticator = self._http_client._session.auth
             caches = getattr(authenticator, "_caches", None)
@@ -133,32 +132,17 @@ class GithubStreamABC(HttpStream, ABC):
         except Exception:
             return None, None
 
-    def _log_rate_limit_probe(self, response: requests.Response) -> None:
+    def _log_rate_limit(self, response: requests.Response) -> None:
         now = time.time()
         if now - GithubStreamABC._last_rate_limit_log_at < 30:
             return
         GithubStreamABC._last_rate_limit_log_at = now
         app_id, installation_id = self._active_github_app_identity()
-        # What actually went on the wire, not what the authenticator object believes: the token
-        # TYPE prefix only (`token ghs_` = installation token, `ghp_`/`github_pat_` = PAT,
-        # `ghu_` = user-to-server, `Bearer eyJ` = app JWT) - never the secret itself.
-        sent_auth = response.request.headers.get("Authorization", "") if response.request is not None else ""
-        # sha256 prefix of the bare token, so it can be matched against a token recovered
-        # elsewhere (`echo -n "$T" | sha256sum | cut -c1-8`) without ever logging the secret.
-        sent_token_fp = hashlib.sha256(sent_auth.split(" ", 1)[-1].encode()).hexdigest()[:8] if sent_auth else None
         self.logger.info(
-            "github_rate_limit_probe: stream=%s app_id=%s installation_id=%s sent_auth_prefix=%r sent_token_fp=%s "
-            "x_oauth_scopes=%r resource=%s request_id=%s edge=%s url=%s remaining=%s limit=%s used=%s reset=%s",
+            "github_rate_limit: stream=%s app_id=%s installation_id=%s remaining=%s limit=%s used=%s reset=%s",
             self.name,
             app_id,
             installation_id,
-            sent_auth[:10],
-            sent_token_fp,
-            response.headers.get("X-OAuth-Scopes"),
-            response.headers.get("X-RateLimit-Resource"),
-            response.headers.get("X-GitHub-Request-Id"),
-            response.headers.get("x-github-edge-region"),
-            response.url,
             response.headers.get("X-RateLimit-Remaining"),
             response.headers.get("X-RateLimit-Limit"),
             response.headers.get("X-RateLimit-Used"),
@@ -172,7 +156,7 @@ class GithubStreamABC(HttpStream, ABC):
         stream_slice: Mapping[str, Any] = None,
         next_page_token: Mapping[str, Any] = None,
     ) -> Iterable[Mapping]:
-        self._log_rate_limit_probe(response)
+        self._log_rate_limit(response)
         for record in response.json():  # GitHub puts records in an array.
             yield self.transform(record=record, stream_slice=stream_slice)
 
@@ -1707,7 +1691,7 @@ class WorkflowRuns(SemiIncrementalMixin, GithubStream):
         return f"repos/{stream_slice['repository']}/actions/runs"
 
     def parse_response(self, response: requests.Response, stream_slice: Mapping[str, Any] = None, **kwargs) -> Iterable[Mapping]:
-        self._log_rate_limit_probe(response)
+        self._log_rate_limit(response)
         items = self._safe_json_list(response, key="workflow_runs")
         if items is None:
             return
@@ -1789,7 +1773,7 @@ class WorkflowJobs(SemiIncrementalMixin, GithubStream):
         stream_slice: Mapping[str, Any] = None,
         next_page_token: Mapping[str, Any] = None,
     ) -> Iterable[Mapping]:
-        self._log_rate_limit_probe(response)
+        self._log_rate_limit(response)
         items = self._safe_json_list(response, key="jobs")
         if items is None:
             return
