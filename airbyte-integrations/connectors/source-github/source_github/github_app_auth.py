@@ -406,15 +406,44 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
         try:
             cache = self._cache_for_request(request)
             if cache is None or self._caches is None:
+                # Unthrottled by design: only ever called during an actual rate-limit event, so
+                # this can't spam under normal operation, and it's the one place that shows
+                # directly why rotation was or wasn't chosen instead of the ~58min sleep.
+                logger.info(
+                    "github_app_auth: has_alternative_token found no sending cache for this "
+                    "request (cache=%s, caches_ready=%s) - cannot rotate, falling back to backoff wait",
+                    cache,
+                    self._caches is not None,
+                )
                 return False
             with self._lock:
                 sender_exhausted = cache.remaining is not None and cache.remaining <= _BUDGET_MIN_RESERVE
+                states = ", ".join(f"app_id={c._app_id} remaining={c.remaining}" for c in self._caches)
                 if not sender_exhausted:
+                    logger.info(
+                        "github_app_auth: has_alternative_token sender app_id=%s remaining=%s is not exhausted "
+                        "(reserve=%s) - not rotating, falling back to backoff wait. All: %s",
+                        cache._app_id,
+                        cache.remaining,
+                        _BUDGET_MIN_RESERVE,
+                        states,
+                    )
                     return False
-                return any(
+                alternative = any(
                     other is not cache and (other.remaining is None or other.remaining > _BUDGET_MIN_RESERVE) for other in self._caches
                 )
+                logger.info(
+                    "github_app_auth: has_alternative_token sender app_id=%s remaining=%s is exhausted (reserve=%s), "
+                    "alternative_available=%s. All: %s",
+                    cache._app_id,
+                    cache.remaining,
+                    _BUDGET_MIN_RESERVE,
+                    alternative,
+                    states,
+                )
+                return alternative
         except Exception:
+            logger.debug("github_app_auth: has_alternative_token failed", exc_info=True)
             return False
 
     @staticmethod
