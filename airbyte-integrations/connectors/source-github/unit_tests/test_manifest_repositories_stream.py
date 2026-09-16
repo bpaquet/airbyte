@@ -507,6 +507,31 @@ def test_pagination_follows_link_header(rate_limit_mock_response, requests_mock)
     assert [request.qs.get("after") for request in listings] == [None, ["cursor2"]]
 
 
+def test_pagination_follows_link_header_with_plain_page_param(rate_limit_mock_response, requests_mock):
+    """GitHub only starts returning an opaque `after` cursor in `rel="next"` once a listing
+    crosses its undocumented deep-pagination cutoff (~10,000 items); any listing below that
+    depth gets a plain `page=N` link with no `after` at all. A paginator that only recognizes
+    `after` treats that as "no more pages" and silently stops after page 1 — this is the
+    regression `page_link_paginator` must not reintroduce."""
+    config = {"credentials": {"personal_access_token": "token"}, "repositories": ["docker/*"]}
+    page1 = [_repo(index, f"docker/repo{index}") for index in range(100)]
+    requests_mock.get(
+        "https://api.github.com/orgs/docker/repos",
+        [
+            {"json": page1, "headers": _next_link("https://api.github.com/orgs/docker/repos?per_page=100&page=2")},
+            {"json": [_repo(200, "docker/last")]},
+        ],
+    )
+
+    records, _, error = _read(config)
+
+    assert error is None
+    assert len(records) == 101
+    assert "docker/last" in _names(records)
+    listings = [request for request in requests_mock.request_history if request.path == "/orgs/docker/repos"]
+    assert [request.qs.get("page") for request in listings] == [None, ["2"]]
+
+
 def test_short_page_with_next_link_is_followed(rate_limit_mock_response, requests_mock):
     """A page shorter than `per_page` that still carries a next link must be followed. Inferring
     end-of-data from a short page (the PageIncrement behavior this replaced) truncated the org

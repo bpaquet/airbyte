@@ -536,19 +536,26 @@ definitions:
   page_link_paginator:
     type: DefaultPaginator
     page_token_option:
-      type: RequestOption
-      inject_into: request_parameter
-      # GitHub's own `link: rel="next"` already carries an opaque `after` cursor alongside
-      # `page`, and once page*per_page crosses GitHub's undocumented deep-pagination cutoff
-      # (~10,000), requesting that same `page` value 422s ("Pagination with the page parameter
-      # is not supported for large datasets, please use cursor based pagination (after/before)")
-      # — even though GitHub itself just offered it. `after` alone (no `page` at all) works at
-      # any depth, confirmed live against a large repository. `field_name`/`cursor_value` must
-      # agree on the same param, so this only extracts `after`, not `page` — a GitHub Enterprise
-      # Server instance whose `next` link doesn't carry an `after` cursor would have its
-      # pagination stop after the first page instead. No known GHES user of this fork yet;
-      # revisit with a custom requester if that changes.
-      field_name: "after"
+      # Follow GitHub's own `link: rel="next"` URL verbatim instead of extracting one
+      # parameter and reinjecting it under a hardcoded name. GitHub's docs say to do exactly
+      # this ("use the URL provided in the Link header... don't just increment the page
+      # parameter"), and it is the only form that is correct at every depth:
+      # - Below GitHub's undocumented ~10,000-item deep-pagination cutoff, `next` carries a
+      #   plain `page=N` (no `after` at all).
+      # - Past that cutoff, requesting the same `page` value 422s ("Pagination with the page
+      #   parameter is not supported for large datasets, please use cursor based pagination
+      #   (after/before)"), and `next` instead carries an opaque `after` cursor.
+      # A single static `field_name` (`page` or `after`) can only ever match one of these two
+      # shapes, which is what silently capped every stream sharing this paginator at 100
+      # records once `field_name` was pinned to `after` alone. RequestPath sidesteps the
+      # format entirely — whatever GitHub returns, this replays it — and also avoids the
+      # separate percent-encoding round-trip a `field_name`-based `after` extraction needs.
+      #
+      # The requester's own `per_page`/`sort`/`direction` request_parameters still get sent
+      # on every request, duplicating what's already in this URL's query string; GitHub
+      # accepts the repeated identical params fine (confirmed live), and page 1 (no
+      # next_page_token yet) still needs them since there's no prior `next` URL to replay.
+      type: RequestPath
     pagination_strategy:
       # GitHub's documented end-of-data signal is the absence of a `rel="next"` link
       # header — a short page is not guaranteed to be the last page. This mirrors the
@@ -561,19 +568,11 @@ definitions:
       # access would raise Jinja's UndefinedError. InterpolatedString defaults `default` to
       # the template itself, so JinjaInterpolation.eval's UndefinedError guard just
       # re-evaluates the same failing expression and the error escapes, failing the sync.
-      # On the last page there is no `next` link, so `regex_search` gets "" and returns None;
+      # On the last page there is no `next` link, so this evaluates to "", and
       # CursorPaginationStrategy ends on `token if token else None`, so pagination stops.
-      #
-      # regex_search returns the cursor still percent-encoded (from the link header), and the
-      # requester re-encodes it, double-encoding it. No urldecode filter exists, so undo the
-      # percent-encoding of base64's own special chars (=, +, /) by hand.
       type: CursorPagination
       cursor_value: >-
-        {{ headers.get("link", {}).get("next", {}).get("url", "")
-           | regex_search("[?&]after=([^&]+)")
-           | regex_replace("%3[Dd]", "=")
-           | regex_replace("%2[Bb]", "+")
-           | regex_replace("%2[Ff]", "/") }}
+        {{ headers.get("link", {}).get("next", {}).get("url", "") }}
 
   # Resolver streams: internal parent streams used only to drive the shared
   # partition routers below. They are not exposed in the catalog.
@@ -1422,7 +1421,7 @@ definitions:
   #
   # The streams below differ only in path, primary key and schema, so they share this
   # retriever. Each is partitioned by `repository_partition_router`, and pagination follows
-  # GitHub's `rel="next"` link header's `after` cursor (see `page_link_paginator` below).
+  # GitHub's `rel="next"` link header verbatim (see `page_link_paginator` above).
   repository_scoped_retriever:
     type: SimpleRetriever
     record_selector:
