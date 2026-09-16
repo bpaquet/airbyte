@@ -2,10 +2,11 @@
 # Copyright (c) 2026 Airbyte, Inc., all rights reserved.
 #
 
+import threading
+
 import pytest
+import requests
 from freezegun import freeze_time
-from source_github import SourceGithub
-from source_github.github_app_auth import GithubAppMultiPemAuthenticator, _parse_entries
 
 from airbyte_cdk.models import FailureType
 from airbyte_cdk.sources.declarative.auth.rate_limited_multiple_token import (
@@ -14,7 +15,13 @@ from airbyte_cdk.sources.declarative.auth.rate_limited_multiple_token import (
 from airbyte_cdk.sources.declarative.models.declarative_component_schema import (
     SelectiveAuthenticator as SelectiveAuthenticatorModel,
 )
+from airbyte_cdk.sources.streams.http.requests_native_auth.protocols import (
+    ResponseAwareAuthenticator,
+    TokenRotatingAuthenticator,
+)
 from airbyte_cdk.utils import AirbyteTracedException
+from source_github import SourceGithub
+from source_github.github_app_auth import GithubAppMultiPemAuthenticator, _parse_entries
 
 
 FAKE_PEM = (
@@ -294,3 +301,246 @@ class TestSourceGithubIntegration:
             config=transformed,
         )
         assert isinstance(authenticator, RateLimitedMultipleTokenAuthenticator)
+
+
+def _prepared_request_with_token(token):
+    request = requests.Request("GET", "https://api.github.com/repos/org/repo/actions/runs").prepare()
+    request.headers["Authorization"] = f"token {token}"
+    return request
+
+
+def _response(status_code=200, remaining=None, reset_at=None, limit=None, retry_after=None):
+    response = requests.Response()
+    response.status_code = status_code
+    if remaining is not None:
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+    if reset_at is not None:
+        response.headers["X-RateLimit-Reset"] = str(int(reset_at))
+    if limit is not None:
+        response.headers["X-RateLimit-Limit"] = str(limit)
+    if retry_after is not None:
+        response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+def _two_app_authenticator(requests_mock, remaining_a=500, remaining_b=500, reset_at=4070908800):
+    requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+    requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+    requests_mock.get(
+        "https://api.github.com/rate_limit",
+        [
+            {"json": {"resources": {"core": {"remaining": remaining_a, "reset": reset_at}}}},
+            {"json": {"resources": {"core": {"remaining": remaining_b, "reset": reset_at}}}},
+        ],
+    )
+    authenticator = GithubAppMultiPemAuthenticator(
+        config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
+    )
+    assert authenticator.token == "token ghs_a"  # forces _ensure_ready() so both caches exist
+    return authenticator
+
+
+class TestProtocolMembership:
+    def test_implements_response_aware_and_token_rotating_protocols(self):
+        """`HttpClient` dispatches to these structurally (isinstance against a
+        `runtime_checkable` Protocol), not via a declared base class — confirm a real instance
+        actually satisfies both, since a typo'd method name would silently opt the connector
+        back into local-counter-only drift with no error anywhere."""
+        authenticator = GithubAppMultiPemAuthenticator.__new__(GithubAppMultiPemAuthenticator)
+        authenticator.__post_init__({})
+        assert isinstance(authenticator, ResponseAwareAuthenticator)
+        assert isinstance(authenticator, TokenRotatingAuthenticator)
+
+
+class TestResponseAwareRotation:
+    def test_explicit_zero_on_sending_cache_enables_rotation_without_a_refresh_quota_poll(self, requests_mock):
+        """This is the exact incident this class exists to prevent: GitHub genuinely exhausts
+        app 1 (a real `X-RateLimit-Remaining: 0`), but app 1's locally tracked `remaining` was
+        seeded high and never independently re-polled. Without `update_from_response` reconciling
+        the real header, `has_alternative_token` would keep seeing app 1 as healthy and the
+        connector would retry the same dead app until the retry budget ran out — which is what
+        happened in production. Only 2 `/rate_limit` calls are mocked (the initial seed for each
+        app); a 3rd call would error, proving rotation here does not depend on re-polling it."""
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+
+        authenticator.update_from_response(request, _response(status_code=403, remaining=0, reset_at=4070908800))
+
+        assert authenticator.has_alternative_token(request) is True
+        assert authenticator.token == "token ghs_b"
+
+    def test_secondary_rate_limit_does_not_zero_the_pool_or_report_an_alternative(self, requests_mock):
+        """A secondary/abuse-detection rejection (`Retry-After`, no quota headers) is a
+        different, usually shared-across-credentials limit — not this cache's primary quota
+        being spent. Zeroing it here would rotate onto another app about to hit the exact same
+        secondary rejection, burning a retry for nothing."""
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+        cache_a = authenticator._caches[0]
+        before = cache_a.remaining
+
+        authenticator.update_from_response(request, _response(status_code=403, retry_after=120))
+
+        assert cache_a.remaining == before
+        assert authenticator.has_alternative_token(request) is False
+
+    def test_permission_403_with_healthy_quota_does_not_park_the_cache(self, requests_mock):
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+
+        authenticator.update_from_response(request, _response(status_code=403, remaining=487, reset_at=4070908800))
+
+        assert authenticator._caches[0].remaining == 487
+        assert authenticator.has_alternative_token(request) is False
+
+    def test_single_app_reports_no_alternative(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 500, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        request = _prepared_request_with_token(authenticator.token.split(" ")[1])
+
+        authenticator.update_from_response(request, _response(status_code=403, remaining=0, reset_at=4070908800))
+
+        assert authenticator.has_alternative_token(request) is False
+
+    def test_unknown_token_is_a_no_op(self, requests_mock):
+        """A response for a request this authenticator never signed (or from before a cache
+        re-minted its token) must not raise and must not touch any cache's state."""
+        authenticator = _two_app_authenticator(requests_mock)
+        before = [cache.remaining for cache in authenticator._caches]
+        request = _prepared_request_with_token("some-other-tokens-value")
+
+        authenticator.update_from_response(request, _response(status_code=403, remaining=0, reset_at=4070908800))
+
+        assert [cache.remaining for cache in authenticator._caches] == before
+        assert authenticator.has_alternative_token(request) is False
+
+    def test_cached_response_is_ignored(self, requests_mock):
+        """A replayed cache hit carries the rate-limit headers from whenever it was first
+        fetched and consumed no quota of its own; reconciling against it would be wrong."""
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+        before = authenticator._caches[0].remaining
+        response = _response(status_code=403, remaining=0, reset_at=4070908800)
+        response.from_cache = True
+
+        authenticator.update_from_response(request, response)
+
+        assert authenticator._caches[0].remaining == before
+
+    def test_out_of_order_response_never_increases_remaining_within_the_same_window(self, requests_mock):
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+
+        authenticator.update_from_response(request, _response(status_code=200, remaining=80, reset_at=4070908800))
+        assert authenticator._caches[0].remaining == 80
+
+        # A slower, out-of-order response reporting a higher count from the same window must
+        # not resurrect the counter another (faster) concurrent request already brought down.
+        authenticator.update_from_response(request, _response(status_code=200, remaining=90, reset_at=4070908800))
+        assert authenticator._caches[0].remaining == 80
+
+    def test_window_rollover_replaces_the_counter_wholesale(self, requests_mock):
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+        authenticator.update_from_response(request, _response(status_code=200, remaining=10, reset_at=4070908800))
+        assert authenticator._caches[0].remaining == 10
+
+        # A response with a newer reset than what's locally tracked means a fresh window arrived;
+        # take its numbers wholesale even though 5000 > 10 would otherwise look like a regression.
+        authenticator.update_from_response(request, _response(status_code=200, remaining=5000, reset_at=4070908801))
+        assert authenticator._caches[0].remaining == 5000
+        assert authenticator._caches[0].reset_at == 4070908801
+
+    def test_explicit_zero_overrides_out_of_order_ordering(self, requests_mock):
+        """The one case an exhaustion signal must win even though its `reset_at` looks stale
+        relative to what is locally tracked: a real, explicit zero must never be dropped, or a
+        rate limit whose reset header trails the value already held would silently break
+        rotation."""
+        authenticator = _two_app_authenticator(requests_mock)
+        request = _prepared_request_with_token("ghs_a")
+        authenticator.update_from_response(request, _response(status_code=200, remaining=200, reset_at=4070908800))
+
+        authenticator.update_from_response(request, _response(status_code=403, remaining=0, reset_at=4070908700))
+
+        assert authenticator._caches[0].remaining == 0
+
+    def test_concurrent_updates_from_different_apps_do_not_corrupt_state(self, requests_mock):
+        authenticator = _two_app_authenticator(requests_mock)
+        request_a = _prepared_request_with_token("ghs_a")
+        request_b = _prepared_request_with_token("ghs_b")
+        errors = []
+
+        def hammer(request, remaining):
+            try:
+                for _ in range(200):
+                    authenticator.update_from_response(request, _response(status_code=200, remaining=remaining, reset_at=4070908800))
+            except Exception as e:  # pragma: no cover - failure path only
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=hammer, args=(request_a, 300)),
+            threading.Thread(target=hammer, args=(request_b, 400)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert authenticator._caches[0].remaining == 300
+        assert authenticator._caches[1].remaining == 400
+
+    def test_end_to_end_rate_limited_response_rotates_without_sleeping_out_the_window(self, requests_mock, monkeypatch):
+        """Reproduces the production incident through the real CDK `HttpClient`: the first app's
+        installation token gets a 403 with `X-RateLimit-Remaining: 0`. Before this fix, the
+        authenticator's stale local counter would report no alternative, `HttpClient` would sleep
+        out the ~1h reset window, and the retry would hit the same exhausted app again. With
+        `update_from_response`/`has_alternative_token` wired in, the retry must go out on app 2's
+        token immediately, and no sleep of the reset-window's magnitude should ever be requested.
+        """
+        import logging
+
+        from airbyte_cdk.sources.streams.http import HttpClient
+        from airbyte_cdk.sources.streams.http.error_handlers import HttpStatusErrorHandler
+        from airbyte_cdk.sources.streams.http.error_handlers.response_models import ErrorResolution, ResponseAction
+
+        authenticator = _two_app_authenticator(requests_mock)
+
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+        requests_mock.get(
+            "https://api.github.com/repos/org/repo/actions/runs",
+            [
+                {"status_code": 403, "headers": {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "4070908800"}, "json": {}},
+                {"status_code": 200, "json": {"workflow_runs": []}},
+            ],
+        )
+
+        error_handler = HttpStatusErrorHandler(
+            logger=logging.getLogger("airbyte"),
+            error_mapping={403: ErrorResolution(response_action=ResponseAction.RATE_LIMITED, failure_type=None)},
+            max_retries=3,
+        )
+        client = HttpClient(name="test", logger=logging.getLogger("airbyte"), error_handler=error_handler, authenticator=authenticator)
+        request, response = client.send_request(
+            http_method="GET", url="https://api.github.com/repos/org/repo/actions/runs", request_kwargs={}
+        )
+
+        assert response.status_code == 200
+        history = [r for r in requests_mock.request_history if r.url == "https://api.github.com/repos/org/repo/actions/runs"]
+        # Exactly one retry happened (the 403 was recovered from, not treated as fatal).
+        # `request_history` isn't used to check *which* token each attempt carried: the CDK
+        # reuses and re-signs the same `PreparedRequest` object across retries, so by the time
+        # the history is inspected here every entry aliases the same, now-final-token object —
+        # a `requests_mock` artifact, not evidence about what was actually sent on the wire.
+        # `_caches` state (updated synchronously as each real response comes in) is the reliable
+        # signal instead: app 1 must have been marked exhausted and app 2 must be the one that
+        # ultimately went out and is now itself slightly spent.
+        assert len(history) == 2
+        assert authenticator._caches[0].remaining == 0
+        assert authenticator._caches[1].remaining is not None and 0 < authenticator._caches[1].remaining < 500
+        # The only sleeps observed must be tiny/incidental (e.g. jittered retry backoff), never
+        # anything near the reset window (which would be ~3600s in a real incident).
+        assert all(s < 5 for s in sleeps), f"a sleep near the reset-window magnitude was requested: {sleeps}"
