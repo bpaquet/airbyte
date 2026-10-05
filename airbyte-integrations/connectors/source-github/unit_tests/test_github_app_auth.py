@@ -500,6 +500,19 @@ class TestUnexpectedHttpErrorsAreClassified:
 
         assert exc_info.value.failure_type == FailureType.transient_error
 
+    def test_401_during_quota_seeding_is_a_config_error_not_transient(self, requests_mock):
+        """A revoked installation token must read as an auth failure, not as a retryable blip —
+        same rule the manifest documents for the token path's `QuotaStatusSource` (401/403 must
+        never be treated as 'quota tracking unavailable')."""
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", status_code=401, json={"message": "Bad credentials"})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        with pytest.raises(AirbyteTracedException) as exc_info:
+            _sign(authenticator)
+
+        assert exc_info.value.failure_type == FailureType.config_error
+
 
 class TestSingleChargePerRequest:
     """`HttpRequester._request_headers()` reads the `token` property once, as a header preview,
