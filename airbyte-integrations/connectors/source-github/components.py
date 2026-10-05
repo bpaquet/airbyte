@@ -16,10 +16,11 @@ import logging
 import struct
 import threading
 import time
+import weakref
 from dataclasses import InitVar, dataclass
 from itertools import groupby
 from os import getenv
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import jwt
@@ -758,7 +759,7 @@ class _InstallationTokenCache:
                 internal_message=f"Installation token exchange failed for app_id={self._app_id}: {response.status_code} {response.text}",
                 failure_type=FailureType.config_error,
             )
-        response.raise_for_status()
+        _raise_for_status_as_transient_error(response, f"installation token exchange for app_id={self._app_id}")
         self._token = response.json()["token"]
         self._expires_at = time.time() + _INSTALLATION_TOKEN_LIFETIME_SECONDS - _REFRESH_MARGIN_SECONDS
         LOGGER.info(
@@ -791,7 +792,7 @@ class _InstallationTokenCache:
             self.remaining = None
             self.reset_at = None
             return
-        response.raise_for_status()
+        _raise_for_status_as_transient_error(response, f"rate_limit seeding for app_id={self._app_id}")
         core = response.json()["resources"]["core"]
         self.remaining = core["remaining"]
         self.reset_at = core["reset"]
@@ -799,6 +800,21 @@ class _InstallationTokenCache:
 
 def _raise_config_error(message: str) -> None:
     raise AirbyteTracedException(message=message, internal_message=message, failure_type=FailureType.config_error)
+
+
+def _raise_for_status_as_transient_error(response: requests.Response, context: str) -> None:
+    """Like `response.raise_for_status()`, but classified: an unexpected status (a GitHub/GHES
+    5xx, not one of the config-error codes already handled above) must surface as
+    `failure_type=transient_error`, the same classification the token path's CDK-managed error
+    handling gives an equivalent blip, rather than an unclassified raw `requests.HTTPError`."""
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise AirbyteTracedException(
+            message="GitHub App authentication failed due to a temporary GitHub error. This is usually transient; please retry.",
+            internal_message=f"Unexpected status during {context}: {response.status_code} {response.text}",
+            failure_type=FailureType.transient_error,
+        ) from e
 
 
 def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
@@ -845,6 +861,51 @@ def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
     return entries
 
 
+class _SharedGithubAppState:
+    """The installation caches/rotation state every `GithubAppMultiPemAuthenticator` built for
+    the same config shares.
+
+    `ModelToComponentFactory.create_custom_component` never caches instances the way
+    `create_rate_limited_multiple_token_authenticator` caches the token path's authenticator —
+    every stream's requester gets a fresh `GithubAppMultiPemAuthenticator` object. Without
+    sharing this state across those objects, each stream would mint its own installation tokens
+    and track its own quota estimate, unaware of every other stream's consumption — exactly what
+    a shared authenticator exists to prevent (see this connector's AGENTS.md).
+    """
+
+    def __init__(self, max_wait_seconds: float) -> None:
+        self.max_wait_seconds = max_wait_seconds
+        self.caches: Optional[List[_InstallationTokenCache]] = None
+        self.active_index = 0
+        self.lock = threading.Lock()
+
+
+# Keyed by `id(config)`, paired with a strong reference to `config` itself so an id can never be
+# silently reused for an unrelated config while its entry is still alive — `config` (a plain
+# dict) cannot be a `weakref`/`WeakKeyDictionary` key. Entries accumulate for the process's
+# lifetime, same as every real deployment's: one sync per process. Test suites construct at most
+# a few dozen sources in one process, which is what keeps distinct test fixtures (e.g. the same
+# `app_id`/`installation_id`/PEM reused across many tests in one config-per-test) from bleeding
+# into each other the way a cache keyed only by (github_apps, api_url, max_wait_seconds) would.
+_shared_state_by_config_id: Dict[int, Tuple[Mapping[str, Any], Dict[Tuple[str, str, float], _SharedGithubAppState]]] = {}
+_shared_state_registry_lock = threading.Lock()
+
+
+def _get_shared_state(config: Mapping[str, Any], github_apps_value: str, api_url: str, max_wait_seconds: float) -> _SharedGithubAppState:
+    key = (github_apps_value, api_url, max_wait_seconds)
+    with _shared_state_registry_lock:
+        entry = _shared_state_by_config_id.get(id(config))
+        if entry is None or entry[0] is not config:
+            entry = (config, {})
+            _shared_state_by_config_id[id(config)] = entry
+        per_config = entry[1]
+        state = per_config.get(key)
+        if state is None:
+            state = _SharedGithubAppState(max_wait_seconds)
+            per_config[key] = state
+        return state
+
+
 @dataclass
 class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
     """Authenticates as one or more GitHub App installations from `credentials.github_apps`:
@@ -859,64 +920,65 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
 
     def __post_init__(self, parameters: Mapping[str, Any]) -> None:
         # `create_selective_authenticator` builds every `authenticators:` branch eagerly, so this
-        # also runs in "token" mode with `github_apps` empty — parsing/validation/network calls
-        # are deferred to `_ensure_ready`, reached only if this branch is actually selected.
-        self._parameters = parameters
-        self._caches: Optional[List[_InstallationTokenCache]] = None
-        self._active_index = 0
-        # Guards `_caches`/`_active_index` and each cache's `remaining` counter against
-        # concurrent partition reads sharing this one authenticator instance.
-        self._lock = threading.Lock()
+        # also runs in "token" mode with `github_apps` empty — the eval below is side-effect-free
+        # (no parsing/validation/network calls), which stay deferred to `_ensure_ready`, reached
+        # only if this branch is actually selected.
+        github_apps_value = InterpolatedString.create(self.github_apps, parameters=parameters).eval(self.config)
+        # Same source and default as `requester_base.url_base`, so GitHub App auth works against
+        # GitHub Enterprise Server exactly like the token-based auth methods do.
+        api_url = self.config.get("api_url") or "https://api.github.com"
         # Same source, default and `is not none` null-guard as the token path's `max_wait_time`,
         # so `check`'s `config_overrides.max_waiting_time: 1` fail-fast override applies here too
-        # instead of this authenticator always waiting up to the hardcoded 2-hour ceiling.
+        # instead of this authenticator always waiting up to a hardcoded 2-hour ceiling.
         max_waiting_time = self.config.get("max_waiting_time")
-        self._max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
+        max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
+        self._github_apps_value = github_apps_value
+        self._api_url = api_url
+        self._state = _get_shared_state(self.config, github_apps_value, api_url, max_wait_seconds)
 
     def _ensure_ready(self) -> None:
-        if self._caches is not None:
+        state = self._state
+        if state.caches is not None:
             return
-        with self._lock:
-            if self._caches is not None:
+        with state.lock:
+            if state.caches is not None:
                 return
-            github_apps_value = InterpolatedString.create(self.github_apps, parameters=self._parameters).eval(self.config)
-            entries = _parse_entries(github_apps_value) if github_apps_value else []
+            entries = _parse_entries(self._github_apps_value) if self._github_apps_value else []
             if not entries:
                 _raise_config_error("credentials.github_apps must have at least one app_id/installation_id/PEM group")
-            # Same source and default as `requester_base.url_base`, so GitHub App auth works
-            # against GitHub Enterprise Server exactly like the token-based auth methods do.
-            api_url = self.config.get("api_url") or "https://api.github.com"
             caches = [
-                _InstallationTokenCache(app_id, installation_id, private_key, api_url)
+                _InstallationTokenCache(app_id, installation_id, private_key, self._api_url)
                 for app_id, installation_id, private_key in entries
             ]
             for cache in caches:
                 cache.refresh_quota()
-            self._caches = caches
+            state.caches = caches
 
     def _select_cache_locked(self) -> Optional[_InstallationTokenCache]:
-        """Must be called while holding `self._lock`. Returns the active cache with its
+        """Must be called while holding `self._state.lock`. Returns the active cache with its
         `remaining` counter already decremented, or `None` if every cache is exhausted."""
-        n = len(self._caches)
+        state = self._state
+        n = len(state.caches)
         for _ in range(n):
-            cache = self._caches[self._active_index]
+            cache = state.caches[state.active_index]
             if cache.remaining is None or cache.remaining > _BUDGET_MIN_RESERVE:
                 if cache.remaining is not None:
                     cache.remaining -= 1
                 return cache
-            self._active_index = (self._active_index + 1) % n
+            state.active_index = (state.active_index + 1) % n
         return None
 
     def _next_available_cache(self) -> _InstallationTokenCache:
         self._ensure_ready()
+        state = self._state
         while True:
-            with self._lock:
+            with state.lock:
                 cache = self._select_cache_locked()
                 if cache is not None:
                     return cache
-                wait_seconds = max(min(c.reset_at for c in self._caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
+                wait_seconds = max(min(c.reset_at for c in state.caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
 
-                if wait_seconds > self._max_wait_seconds:
+                if wait_seconds > state.max_wait_seconds:
                     raise AirbyteTracedException(
                         message="Rate limit exceeded for all configured GitHub App installations.",
                         failure_type=FailureType.transient_error,
@@ -924,9 +986,20 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 LOGGER.info("github_app_auth: all installations exhausted, sleeping %.0fs until the earliest reset", wait_seconds)
 
             time.sleep(wait_seconds)
-            with self._lock:
-                for cache in self._caches:
+            with state.lock:
+                for cache in state.caches:
                     cache.refresh_quota()
+
+    def __call__(self, request: requests.PreparedRequest) -> Any:
+        """The real signing path. `HttpRequester._request_headers()` already reads the `token`
+        property once, as a header preview, before `HttpClient` invokes this (via
+        `Session.prepare_request()` -> `prepare_auth()`) for the actual send — so the quota
+        charge/rotation decision must live here, the one call per real attempt, not in `token`,
+        or every installation's estimate would be decremented twice per request.
+        """
+        cache = self._next_available_cache()
+        request.headers[self.auth_header] = f"token {cache.get_token()}"
+        return request
 
     @property
     def auth_header(self) -> str:
@@ -934,5 +1007,10 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
 
     @property
     def token(self) -> str:
-        cache = self._next_available_cache()
+        """Side-effect-free preview for `HttpRequester._request_headers()`: the currently active
+        installation's token, with no selection/rotation/decrement — `__call__` runs again right
+        before the request is actually sent and overwrites this value."""
+        self._ensure_ready()
+        with self._state.lock:
+            cache = self._state.caches[self._state.active_index]
         return f"token {cache.get_token()}"

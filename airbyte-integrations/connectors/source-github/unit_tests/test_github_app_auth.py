@@ -40,16 +40,31 @@ def _access_token_url(installation_id):
     return f"https://api.github.com/app/installations/{installation_id}/access_tokens"
 
 
-def _selective_authenticator(config):
+def _sign(authenticator):
+    """Drive a request through the real signing path (`__call__`) rather than reading the
+    `token` property directly: quota accounting now lives in `__call__`, since `HttpRequester`
+    reads `token` once already as a side-effect-free header preview before `HttpClient` invokes
+    `__call__` for the actual send."""
+    request = requests.Request("GET", "https://api.github.com/").prepare()
+    authenticator(request)
+    return request.headers["Authorization"]
+
+
+def _selective_authenticator_from_source(source):
     """Builds the manifest's actual `requester_base.authenticator` (a `SelectiveAuthenticator`)
-    the way `check`/`streams()` do, rather than reaching for `GithubAppMultiPemAuthenticator`
-    directly — the regression that matters is the manifest wiring, not just the class."""
-    source = make_source(catalog=None, config=config, state=None)
+    the way each stream's requester does — a fresh `create_component` call every time, exactly
+    like two different streams independently resolving the same manifest definition."""
     return source._constructor.create_component(
         model_type=SelectiveAuthenticatorModel,
         component_definition=source.resolved_manifest["definitions"]["requester_base"]["authenticator"],
         config=source._config,
     )
+
+
+def _selective_authenticator(config):
+    """Same as `_selective_authenticator_from_source`, building the source from a fresh config
+    first — the regression that matters is the manifest wiring, not just the class."""
+    return _selective_authenticator_from_source(make_source(catalog=None, config=config, state=None))
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +108,7 @@ class TestInstallationTokenMintingAndCaching:
         requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
         authenticator._ensure_ready()  # lazy: entries are only parsed/seeded on first actual use
-        cache = authenticator._caches[0]
+        cache = authenticator._state.caches[0]
         assert cache.get_token() == "ghs_abc"
         assert cache.get_token() == "ghs_abc"
         assert mint_mock.call_count == 1  # _ensure_ready()'s refresh_quota() already minted once; both get_token() calls hit the cache
@@ -106,7 +121,7 @@ class TestInstallationTokenMintingAndCaching:
                 config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM))
             )
             authenticator._ensure_ready()
-            cache = authenticator._caches[0]
+            cache = authenticator._state.caches[0]
             assert cache.get_token() == "ghs_first"
             frozen.tick(delta=__import__("datetime").timedelta(hours=1, minutes=1))
             assert cache.get_token() == "ghs_second"
@@ -115,7 +130,7 @@ class TestInstallationTokenMintingAndCaching:
         requests_mock.post(_access_token_url("222"), status_code=401, json={"message": "Bad credentials"})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
         with pytest.raises(AirbyteTracedException) as exc_info:
-            authenticator.token  # construction itself must never raise — see test_manifest_selective_authenticator_builds_in_token_mode
+            _sign(authenticator)  # construction itself must never raise — see test_manifest_selective_authenticator_builds_in_token_mode
         assert exc_info.value.failure_type == FailureType.config_error
 
 
@@ -133,9 +148,9 @@ class TestStickyRotation:
         authenticator = GithubAppMultiPemAuthenticator(
             config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
         )
-        assert authenticator.token == "token ghs_a"
-        assert authenticator.token == "token ghs_a"
-        assert authenticator.token == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_a"
 
     def test_rotates_once_active_drops_into_reserve(self, requests_mock):
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
@@ -150,8 +165,8 @@ class TestStickyRotation:
         authenticator = GithubAppMultiPemAuthenticator(
             config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
         )
-        assert authenticator.token == "token ghs_a"  # remaining 51 -> 50, still above reserve check next time? no: 50 is not > 50
-        assert authenticator.token == "token ghs_b"  # cache 0 now at 50, not > _BUDGET_MIN_RESERVE (50), rotates
+        assert _sign(authenticator) == "token ghs_a"  # remaining 51 -> 50, still above reserve check next time? no: 50 is not > 50
+        assert _sign(authenticator) == "token ghs_b"  # cache 0 now at 50, not > _BUDGET_MIN_RESERVE (50), rotates
 
     def test_cascades_through_four_installations(self, requests_mock):
         """The rotation logic (`n = len(self._caches)`, generic loop) is written for any N, but
@@ -178,7 +193,7 @@ class TestStickyRotation:
                 ("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM), ("555", "666", FAKE_PEM), ("777", "888", FAKE_PEM)
             ),
         )
-        assert [authenticator.token for _ in range(5)] == [
+        assert [_sign(authenticator) for _ in range(5)] == [
             "token ghs_a",
             "token ghs_b",
             "token ghs_c",
@@ -204,7 +219,7 @@ class TestStickyRotation:
         authenticator = GithubAppMultiPemAuthenticator(
             config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
         )
-        token = authenticator.token
+        token = _sign(authenticator)
         assert token in ("token ghs_a", "token ghs_b")
         assert sleeps == [31.0]  # earliest reset (1030) minus frozen "now" (999)
 
@@ -223,7 +238,7 @@ class TestStickyRotation:
         monkeypatch.setattr("components.time.sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr("components.time.time", lambda: 999.0)
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator.token
+        _sign(authenticator)
         assert sleeps == [5.0]  # floored to _MIN_EXHAUSTION_WAIT_SECONDS, not the raw 0.0
 
 
@@ -263,7 +278,7 @@ class TestConcurrency:
         def worker():
             barrier.wait()
             for _ in range(calls_per_thread):
-                authenticator.token
+                _sign(authenticator)
 
         threads = [threading.Thread(target=worker) for _ in range(n_threads)]
         for t in threads:
@@ -271,7 +286,7 @@ class TestConcurrency:
         for t in threads:
             t.join()
 
-        assert authenticator._caches[0].remaining == seeded - total_calls
+        assert authenticator._state.caches[0].remaining == seeded - total_calls
 
     def test_concurrent_first_use_seeds_quota_once(self, requests_mock):
         """Regression test for double-checked locking in `_ensure_ready`: concurrent first calls
@@ -288,7 +303,7 @@ class TestConcurrency:
 
         def worker():
             barrier.wait()
-            authenticator.token
+            _sign(authenticator)
 
         threads = [threading.Thread(target=worker) for _ in range(n_threads)]
         for t in threads:
@@ -308,8 +323,8 @@ class TestGitHubEnterpriseServerRateLimitingDisabled:
         requests_mock.get("https://api.github.com/rate_limit", status_code=404, json={"message": "Rate limiting is not enabled."})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
 
-        assert authenticator.token == "token ghs_a"
-        assert authenticator._caches[0].remaining is None
+        assert _sign(authenticator) == "token ghs_a"
+        assert authenticator._state.caches[0].remaining is None
 
 
 class TestMaxWaitingTimeOverride:
@@ -328,17 +343,17 @@ class TestMaxWaitingTimeOverride:
         )
 
         with pytest.raises(AirbyteTracedException) as exc_info:
-            authenticator.token
+            _sign(authenticator)
 
         assert exc_info.value.failure_type == FailureType.transient_error
 
     def test_defaults_to_120_minutes_when_absent(self):
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps="")
-        assert authenticator._max_wait_seconds == 120 * 60
+        assert authenticator._state.max_wait_seconds == 120 * 60
 
     def test_respects_a_configured_value(self):
         authenticator = GithubAppMultiPemAuthenticator(config={"max_waiting_time": 5}, parameters={}, github_apps="")
-        assert authenticator._max_wait_seconds == 5 * 60
+        assert authenticator._state.max_wait_seconds == 5 * 60
 
 
 class TestGitHubEnterpriseServerApiUrl:
@@ -356,7 +371,7 @@ class TestGitHubEnterpriseServerApiUrl:
             parameters={},
             github_apps=_github_apps_field(("111", "222", FAKE_PEM)),
         )
-        assert authenticator.token == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_a"
         assert ghes_token_mock.called
         assert ghes_quota_mock.called
 
@@ -364,7 +379,7 @@ class TestGitHubEnterpriseServerApiUrl:
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        assert authenticator.token == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_a"
 
 
 class TestManifestWiring:
@@ -419,3 +434,96 @@ class TestManifestWiring:
         `api_url`/`max_waiting_time` cases this connector already guards against."""
         source = make_source(catalog=None, config={"access_token": "pat-token", "credentials": None, "repositories": ["org/repo"]}, state=None)
         assert source._config["credentials"]["auth_mode"] == "token"
+
+
+class TestSharedStateAcrossStreams:
+    """`ModelToComponentFactory.create_custom_component` never caches instances the way it
+    caches `RateLimitedMultipleTokenAuthenticator` for the token path — every stream's requester
+    gets a fresh `GithubAppMultiPemAuthenticator` object. Without `_get_shared_state`, each would
+    mint its own installation tokens and track its own quota, unaware of every other stream's
+    consumption."""
+
+    def test_two_authenticators_built_from_the_same_config_share_quota_state(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        config = {"credentials": {"github_apps": _github_apps_field(("111", "222", FAKE_PEM))}, "repositories": ["org/repo"]}
+        source = make_source(catalog=None, config=config, state=None)
+
+        # Two separate CustomAuthenticator instances, exactly as two different streams' requesters
+        # would each independently build one by resolving the same manifest definition.
+        first = _selective_authenticator_from_source(source)
+        second = _selective_authenticator_from_source(source)
+        assert first is not second  # the factory really doesn't cache CustomAuthenticator...
+
+        _sign(first)  # ...but charging quota through one must be visible to the other.
+        assert second._state.caches[0].remaining == 4999
+
+    def test_authenticators_built_from_different_sources_do_not_share_state(self, requests_mock):
+        """Symmetric check: sharing is scoped to one source's config, not global — otherwise
+        distinct sources configured with the same installation would corrupt each other's quota
+        tracking (and every test in this module reusing app_id `111`/installation_id `222` would
+        bleed into every other test)."""
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        def _fresh_config():
+            return {"credentials": {"github_apps": _github_apps_field(("111", "222", FAKE_PEM))}, "repositories": ["org/repo"]}
+
+        first_source = make_source(catalog=None, config=_fresh_config(), state=None)
+        second_source = make_source(catalog=None, config=_fresh_config(), state=None)
+
+        first = _selective_authenticator_from_source(first_source)
+        second = _selective_authenticator_from_source(second_source)
+
+        _sign(first)
+        second.token  # side-effect-free: forces _ensure_ready() without charging, so it can be checked below
+        assert first._state.caches[0].remaining == 4999
+        assert second._state.caches[0].remaining == 5000
+
+
+class TestUnexpectedHttpErrorsAreClassified:
+    def test_5xx_during_token_exchange_is_a_transient_error(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), status_code=502, text="bad gateway")
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        with pytest.raises(AirbyteTracedException) as exc_info:
+            _sign(authenticator)
+
+        assert exc_info.value.failure_type == FailureType.transient_error
+
+    def test_5xx_during_quota_seeding_is_a_transient_error(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", status_code=503, text="service unavailable")
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        with pytest.raises(AirbyteTracedException) as exc_info:
+            _sign(authenticator)
+
+        assert exc_info.value.failure_type == FailureType.transient_error
+
+
+class TestSingleChargePerRequest:
+    """`HttpRequester._request_headers()` reads the `token` property once, as a header preview,
+    before `HttpClient` invokes `__call__` (via `Session.prepare_request()` -> `prepare_auth()`)
+    for the actual send. Quota must be charged exactly once per real attempt, from `__call__`
+    alone — not from `token`, which fires an extra time per request."""
+
+    def test_reading_token_as_a_preview_does_not_charge_quota(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        for _ in range(3):
+            assert authenticator.token == "token ghs_a"
+
+        assert authenticator._state.caches[0].remaining == 5000
+
+    def test_call_charges_quota_exactly_once_per_invocation(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        # The realistic sequence for one HTTP attempt: a `token` preview read, then the real send.
+        authenticator.token
+        _sign(authenticator)
+
+        assert authenticator._state.caches[0].remaining == 4999
