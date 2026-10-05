@@ -628,7 +628,11 @@ class ConfigNormalization(ConfigTransformation):
         # branch on regardless of which credentials shape is in play — legacy root-level
         # `access_token`, `credentials.access_token`/`personal_access_token`, or
         # `credentials.github_apps`.
-        credentials = config.setdefault("credentials", {})
+        # `or {}`, not `setdefault`: `credentials` can be present and explicitly null (API,
+        # Terraform, embedded use), which `setdefault` leaves as `None` — the same pitfall as
+        # `api_url` above.
+        credentials = config.get("credentials") or {}
+        config["credentials"] = credentials
         credentials["auth_mode"] = "github_apps" if credentials.get("github_apps") else "token"
 
 
@@ -820,44 +824,25 @@ def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
 
 @dataclass
 class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
-    """
-    Authenticates as one or more GitHub App installations from a single config field
-    (`credentials.github_apps`): repeated groups of app_id line, installation_id line, then the
-    private key .pem pasted as-is (`-----BEGIN...` through `-----END...`) — repeat for more
-    installations, blank lines between groups are fine.
-
-    Each entry gets its own installation-token cache, minted and refreshed independently and
-    lazily — never all at once at startup — which is what lets a single sync outlive any one
-    token's ~1h lifetime.
-
-    With multiple entries, mirrors the PAT path's sticky-until-exhausted rotation
-    (`RateLimitedMultipleTokenAuthenticator`) instead of blindly round-robining every call: stays
-    on one installation while it has quota, rotates to the next once it drops into the reserve,
-    and waits out the earliest reset if all are exhausted.
-    """
+    """Authenticates as one or more GitHub App installations from `credentials.github_apps`:
+    repeated app_id/installation_id/PEM groups, each minted and refreshed independently and
+    lazily so a sync outlives any one token's ~1h lifetime. With multiple entries, mirrors
+    `RateLimitedMultipleTokenAuthenticator`'s sticky-until-exhausted rotation instead of
+    round-robining every call."""
 
     config: Mapping[str, Any]
     parameters: InitVar[Mapping[str, Any]]
     github_apps: Union[InterpolatedString, str]
 
     def __post_init__(self, parameters: Mapping[str, Any]) -> None:
-        # Parsing only — no validation, no network calls. `ModelToComponentFactory
-        # .create_selective_authenticator` builds every branch under `authenticators:` eagerly,
-        # not just the selected one, so this constructor also runs when the config is in "token"
-        # mode and `github_apps` is empty. Raising here (or seeding quota, which would need a
-        # real token) would break every PAT/OAuth user. Both are deferred to first actual use
-        # in `_ensure_ready`, which only happens if this branch is the one truly selected.
+        # `create_selective_authenticator` builds every `authenticators:` branch eagerly, so this
+        # also runs in "token" mode with `github_apps` empty — parsing/validation/network calls
+        # are deferred to `_ensure_ready`, reached only if this branch is actually selected.
         self._parameters = parameters
         self._caches: Optional[List[_InstallationTokenCache]] = None
         self._active_index = 0
-        # Guards `_caches`/`_active_index` and every cache's `remaining` counter.
-        # `ConcurrentDeclarativeSource` can read multiple partition streams in parallel, all
-        # sharing this one authenticator instance (mirroring `RateLimitedMultipleTokenAuthenticator`,
-        # which documents the same requirement) — without a lock, two threads racing the
-        # check-then-decrement in `_next_available_cache`/`token` could both pick an already
-        # exhausted cache, or step on each other's rotation of `_active_index`. Sleeping while
-        # waiting out an exhaustion window happens outside the lock so one thread's wait never
-        # blocks another from making progress.
+        # Guards `_caches`/`_active_index` and each cache's `remaining` counter against
+        # concurrent partition reads sharing this one authenticator instance.
         self._lock = threading.Lock()
 
     def _ensure_ready(self) -> None:

@@ -320,3 +320,9 @@ class TestManifestWiring:
     def test_config_normalization_defaults_auth_mode_to_token(self):
         source = make_source(catalog=None, config={"access_token": "pat-token", "repositories": ["org/repo"]}, state=None)
         assert source._config["credentials"]["auth_mode"] == "token"
+
+    def test_config_normalization_handles_explicitly_null_credentials(self):
+        """`credentials: null` is reachable via the API/Terraform/embedded use, same as the
+        `api_url`/`max_waiting_time` cases this connector already guards against."""
+        source = make_source(catalog=None, config={"access_token": "pat-token", "credentials": None, "repositories": ["org/repo"]}, state=None)
+        assert source._config["credentials"]["auth_mode"] == "token"
