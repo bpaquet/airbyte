@@ -14,7 +14,7 @@ from airbyte_cdk.models.airbyte_protocol import ConnectorSpecification
 from airbyte_cdk.sources import Source
 from airbyte_cdk.sources.declarative.auth.declarative_authenticator import DeclarativeAuthenticator
 from airbyte_cdk.sources.declarative.models.declarative_component_schema import (
-    RateLimitedMultipleTokenAuthenticator as RateLimitedMultipleTokenAuthenticatorModel,
+    SelectiveAuthenticator as SelectiveAuthenticatorModel,
 )
 from airbyte_cdk.sources.declarative.models.declarative_component_schema import (
     UnionPartitionRouter as UnionPartitionRouterModel,
@@ -88,14 +88,21 @@ def resolve_repositories_and_organizations(source: YamlDeclarativeSource, config
 
 
 def get_authenticator(source: YamlDeclarativeSource, config: Mapping[str, Any]) -> DeclarativeAuthenticator:
-    """Return the manifest's `RateLimitedMultipleTokenAuthenticator` — the same cached
-    instance the manifest streams' requesters use (`ModelToComponentFactory` caches by
-    resolved constructor arguments). `config` must be the normalized config the source was
-    constructed with: a differently resolved config yields a different cached instance."""
+    """Return the manifest's `requester_base.authenticator` — the same cached instance the
+    manifest streams' requesters use (`ModelToComponentFactory` caches by resolved constructor
+    arguments). It is a `SelectiveAuthenticator`, keyed on `credentials.auth_mode`
+    (`components.ConfigNormalization`); every config this helper is used with is in "token"
+    mode, so it resolves to the `RateLimitedMultipleTokenAuthenticator` branch.
+
+    Builds from `source._config` (the normalized config), not the `config` argument: the CDK
+    copies the config it is given at construction (`_migrate_and_transform_config`), so
+    `auth_mode` — set in place by `ConfigNormalization` — only lands on that copy. A
+    differently resolved config yields a different cached instance.
+    """
     return source._constructor.create_component(
-        model_type=RateLimitedMultipleTokenAuthenticatorModel,
+        model_type=SelectiveAuthenticatorModel,
         component_definition=source.resolved_manifest["definitions"]["requester_base"]["authenticator"],
-        config=config,
+        config=source._config,
     )
 
 
