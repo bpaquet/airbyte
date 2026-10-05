@@ -87,18 +87,19 @@ def resolve_repositories_and_organizations(source: YamlDeclarativeSource, config
     return organizations, repositories
 
 
-def get_authenticator(source: YamlDeclarativeSource, config: Mapping[str, Any]) -> DeclarativeAuthenticator:
+def get_authenticator(source: YamlDeclarativeSource) -> DeclarativeAuthenticator:
     """Return the manifest's `requester_base.authenticator` — the same cached instance the
     manifest streams' requesters use (`ModelToComponentFactory` caches by resolved constructor
     arguments). It is a `SelectiveAuthenticator`, keyed on `credentials.auth_mode`
     (`components.ConfigNormalization`); every config this helper is used with is in "token"
     mode, so it resolves to the `RateLimitedMultipleTokenAuthenticator` branch.
 
-    Builds from `source._config` (the normalized config), not the `config` argument: the CDK
-    copies the config it is given at construction (`_migrate_and_transform_config`), so
-    `auth_mode` — set in place by `ConfigNormalization` — only lands on that copy. A
+    Builds from `source._config` (the normalized config): the CDK copies the config it is given
+    at construction (`_migrate_and_transform_config`), so `auth_mode` — set in place by
+    `ConfigNormalization` — only lands on that copy, not on a caller's own config object. A
     differently resolved config yields a different cached instance.
     """
+    config = source._config
     return source._constructor.create_component(
         model_type=SelectiveAuthenticatorModel,
         component_definition=source.resolved_manifest["definitions"]["requester_base"]["authenticator"],

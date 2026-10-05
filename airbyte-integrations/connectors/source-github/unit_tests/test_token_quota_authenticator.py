@@ -24,7 +24,7 @@ def _source_and_authenticator(tokens: str, **config_overrides):
     """Build a source and the shared authenticator its manifest streams use."""
     config = {"access_token": tokens, "repositories": ["org/repo"], **config_overrides}
     source = make_source(catalog=None, config=config, state=None)
-    return source, get_authenticator(source, config)
+    return source, get_authenticator(source)
 
 
 def _remaining(authenticator, token, quota="rest"):
@@ -66,7 +66,7 @@ def test_token_precedence_matches_legacy(credentials_config, expected_token, rat
     config = {"repositories": ["org/repo"], **credentials_config}
     source = make_source(catalog=None, config=config, state=None)
 
-    authenticator = get_authenticator(source, config)
+    authenticator = get_authenticator(source)
 
     assert list(authenticator._tokens) == [expected_token]
     assert _get_access_token(config) == expected_token, "manifest and legacy precedence disagree on the token"
@@ -108,7 +108,7 @@ def test_authenticator_instance_is_shared_with_manifest_streams(rate_limit_mock_
     requests_mock.get("https://api.github.com/repos/org/repo", json={"full_name": "org/repo", "organization": {"login": "org"}})
     resolve_repositories_and_organizations(source, config)
 
-    assert get_authenticator(source, config) is manifest_authenticator
+    assert get_authenticator(source) is manifest_authenticator
     assert len(source._constructor._rate_limited_authenticators) == 1
 
 
@@ -122,7 +122,7 @@ def test_quota_is_charged_once_across_repository_resolution_and_probe_stream(rat
     requests_mock.get("https://api.github.com/repos/org/repo/probe_stream", json=[{"id": 1}])
 
     resolve_repositories_and_organizations(source, config)
-    authenticator = get_authenticator(source, config)
+    authenticator = get_authenticator(source)
     after_resolution = _remaining(authenticator, "token1")
 
     list(read_full_refresh(ProbeStream(authenticator=authenticator, repositories=["org/repo"], page_size_for_large_streams=10)))
