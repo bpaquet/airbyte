@@ -99,7 +99,6 @@ def get_authenticator(source: YamlDeclarativeSource) -> DeclarativeAuthenticator
     `ConfigNormalization` — only lands on that copy, not on a caller's own config object. A
     differently resolved config yields a different cached instance.
     """
-    config = source._config
     return source._constructor.create_component(
         model_type=SelectiveAuthenticatorModel,
         component_definition=source.resolved_manifest["definitions"]["requester_base"]["authenticator"],
