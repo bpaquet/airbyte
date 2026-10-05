@@ -16,7 +16,6 @@ import logging
 import struct
 import threading
 import time
-import weakref
 from dataclasses import InitVar, dataclass
 from itertools import groupby
 from os import getenv
@@ -792,6 +791,15 @@ class _InstallationTokenCache:
             self.remaining = None
             self.reset_at = None
             return
+        if response.status_code in (401, 403):
+            # Never classify as transient (same rule the manifest documents for the token path's
+            # `QuotaStatusSource`): a revoked installation token must read as an auth failure, not
+            # as "quota tracking unavailable."
+            raise AirbyteTracedException(
+                message="GitHub App authentication failed. Please verify the app_id, installation_id and private key are correct.",
+                internal_message=f"rate_limit seeding failed for app_id={self._app_id}: {response.status_code} {response.text}",
+                failure_type=FailureType.config_error,
+            )
         _raise_for_status_as_transient_error(response, f"rate_limit seeding for app_id={self._app_id}")
         core = response.json()["resources"]["core"]
         self.remaining = core["remaining"]
@@ -862,16 +870,9 @@ def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
 
 
 class _SharedGithubAppState:
-    """The installation caches/rotation state every `GithubAppMultiPemAuthenticator` built for
-    the same config shares.
-
-    `ModelToComponentFactory.create_custom_component` never caches instances the way
-    `create_rate_limited_multiple_token_authenticator` caches the token path's authenticator —
-    every stream's requester gets a fresh `GithubAppMultiPemAuthenticator` object. Without
-    sharing this state across those objects, each stream would mint its own installation tokens
-    and track its own quota estimate, unaware of every other stream's consumption — exactly what
-    a shared authenticator exists to prevent (see this connector's AGENTS.md).
-    """
+    """Installation caches/rotation state shared by every `GithubAppMultiPemAuthenticator` built
+    for one config — `create_custom_component` has no per-source cache the way the token path's
+    authenticator does (see `_get_shared_state`), so this stands in for one."""
 
     def __init__(self, max_wait_seconds: float) -> None:
         self.max_wait_seconds = max_wait_seconds
@@ -880,30 +881,23 @@ class _SharedGithubAppState:
         self.lock = threading.Lock()
 
 
-# Keyed by `id(config)`, paired with a strong reference to `config` itself so an id can never be
-# silently reused for an unrelated config while its entry is still alive — `config` (a plain
-# dict) cannot be a `weakref`/`WeakKeyDictionary` key. Entries accumulate for the process's
-# lifetime, same as every real deployment's: one sync per process. Test suites construct at most
-# a few dozen sources in one process, which is what keeps distinct test fixtures (e.g. the same
-# `app_id`/`installation_id`/PEM reused across many tests in one config-per-test) from bleeding
-# into each other the way a cache keyed only by (github_apps, api_url, max_wait_seconds) would.
-_shared_state_by_config_id: Dict[int, Tuple[Mapping[str, Any], Dict[Tuple[str, str, float], _SharedGithubAppState]]] = {}
+# Keyed by `id(config)` plus a strong reference to `config` (a plain `dict`, so it can't be a
+# `weakref`/`WeakKeyDictionary` key): the reference is what keeps the `is not config` check below
+# sound, since CPython can only reuse a freed object's id, never one still referenced. Entries
+# accumulate for the process's lifetime — harmless for one-sync-per-process deployments (every
+# published connector image), a slow leak for a long-lived host building many sources (PyAirbyte,
+# Connector Builder's test panel), which this connector hasn't needed to solve before.
+_shared_state_by_config_id: Dict[int, Tuple[Mapping[str, Any], _SharedGithubAppState]] = {}
 _shared_state_registry_lock = threading.Lock()
 
 
-def _get_shared_state(config: Mapping[str, Any], github_apps_value: str, api_url: str, max_wait_seconds: float) -> _SharedGithubAppState:
-    key = (github_apps_value, api_url, max_wait_seconds)
+def _get_shared_state(config: Mapping[str, Any], max_wait_seconds: float) -> _SharedGithubAppState:
     with _shared_state_registry_lock:
         entry = _shared_state_by_config_id.get(id(config))
         if entry is None or entry[0] is not config:
-            entry = (config, {})
+            entry = (config, _SharedGithubAppState(max_wait_seconds))
             _shared_state_by_config_id[id(config)] = entry
-        per_config = entry[1]
-        state = per_config.get(key)
-        if state is None:
-            state = _SharedGithubAppState(max_wait_seconds)
-            per_config[key] = state
-        return state
+        return entry[1]
 
 
 @dataclass
@@ -934,7 +928,7 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
         max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
         self._github_apps_value = github_apps_value
         self._api_url = api_url
-        self._state = _get_shared_state(self.config, github_apps_value, api_url, max_wait_seconds)
+        self._state = _get_shared_state(self.config, max_wait_seconds)
 
     def _ensure_ready(self) -> None:
         state = self._state
