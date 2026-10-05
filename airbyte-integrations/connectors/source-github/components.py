@@ -690,6 +690,9 @@ _INSTALLATION_TOKEN_LIFETIME_SECONDS = 3600
 # stick with an installation until its tracked quota drops into this reserve, then rotate.
 _BUDGET_MIN_RESERVE = 50
 _MAX_WAIT_SECONDS = 60 * 120
+# Floor for the exhaustion wait (matches RateLimitedMultipleTokenAuthenticator.MIN_EXHAUSTION_WAIT),
+# so a stale/skewed reset timestamp can't cause a refresh busy-loop.
+_MIN_EXHAUSTION_WAIT_SECONDS = 5.0
 
 
 class _InstallationTokenCache:
@@ -702,10 +705,11 @@ class _InstallationTokenCache:
     calls with a token that died partway through.
     """
 
-    def __init__(self, app_id: str, installation_id: str, private_key: str) -> None:
+    def __init__(self, app_id: str, installation_id: str, private_key: str, api_url: str) -> None:
         self._app_id = app_id
         self._installation_id = installation_id
         self._private_key = private_key
+        self._api_url = api_url.rstrip("/")
         self._token: Optional[str] = None
         self._expires_at: float = 0.0
         self.remaining: Optional[int] = None
@@ -735,7 +739,7 @@ class _InstallationTokenCache:
 
     def _refresh_token(self) -> None:
         response = requests.post(
-            f"https://api.github.com/app/installations/{self._installation_id}/access_tokens",
+            f"{self._api_url}/app/installations/{self._installation_id}/access_tokens",
             headers={
                 "Authorization": f"Bearer {self._mint_app_jwt()}",
                 "Accept": "application/vnd.github+json",
@@ -770,7 +774,7 @@ class _InstallationTokenCache:
     def refresh_quota(self) -> None:
         """Seed `remaining`/`reset_at` from GitHub's own accounting for this installation."""
         response = requests.get(
-            "https://api.github.com/rate_limit",
+            f"{self._api_url}/rate_limit",
             headers={"Authorization": f"token {self.get_token()}", "Accept": "application/vnd.github+json"},
             timeout=30,
         )
@@ -855,7 +859,13 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
             entries = _parse_entries(github_apps_value) if github_apps_value else []
             if not entries:
                 raise ValueError("credentials.github_apps must have at least one app_id/installation_id/PEM group")
-            caches = [_InstallationTokenCache(app_id, installation_id, private_key) for app_id, installation_id, private_key in entries]
+            # Same source and default as `requester_base.url_base`, so GitHub App auth works
+            # against GitHub Enterprise Server exactly like the token-based auth methods do.
+            api_url = self.config.get("api_url") or "https://api.github.com"
+            caches = [
+                _InstallationTokenCache(app_id, installation_id, private_key, api_url)
+                for app_id, installation_id, private_key in entries
+            ]
             for cache in caches:
                 cache.refresh_quota()
             self._caches = caches
@@ -880,7 +890,7 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 cache = self._select_cache_locked()
                 if cache is not None:
                     return cache
-                wait_seconds = max(0.0, min(c.reset_at for c in self._caches) - time.time())
+                wait_seconds = max(min(c.reset_at for c in self._caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
 
             if wait_seconds > _MAX_WAIT_SECONDS:
                 raise AirbyteTracedException(
@@ -891,6 +901,69 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
             time.sleep(wait_seconds)
             for cache in self._caches:
                 cache.refresh_quota()
+
+    def update_from_response(self, request: requests.PreparedRequest, response: requests.Response) -> None:
+        """Reconcile the sending installation's local counters against what GitHub reported.
+
+        Implements `ResponseAwareAuthenticator` (airbyte_cdk.sources.streams.http
+        .requests_native_auth.protocols), dispatched structurally — `HttpClient` calls this on
+        every response. Simpler than `RateLimitedMultipleTokenAuthenticator.update_from_response`:
+        one pool per installation, no window-rollover/limit tracking, since GitHub Apps have no
+        second quota class (GraphQL) to distinguish the way PAT/OAuth tokens do here.
+        """
+        if self._caches is None:
+            return
+        token = self._token_from_request(request)
+        if token is None:
+            return
+        remaining = self._header_int(response, "X-RateLimit-Remaining")
+        reset_at = self._header_int(response, "X-RateLimit-Reset")
+        if remaining is None and reset_at is None:
+            return
+        with self._lock:
+            cache = next((c for c in self._caches if c._token == token), None)
+            if cache is None:
+                return
+            if reset_at is not None and (cache.reset_at is None or reset_at > cache.reset_at):
+                # A later reset means a fresh window; the response's own remaining count (or a
+                # full unknown-limit retreat to None) describes it, not the stale local one.
+                cache.reset_at = reset_at
+                cache.remaining = remaining
+            elif remaining is not None:
+                # Same window: only ever tighten the estimate, never loosen it from a
+                # possibly-reordered response.
+                cache.remaining = remaining if cache.remaining is None else min(cache.remaining, remaining)
+
+    def has_alternative_token(self, request: requests.PreparedRequest) -> bool:
+        """Implements `TokenRotatingAuthenticator`: whether a different installation could serve
+        this request right now, so `HttpClient` retries promptly instead of sleeping out a
+        window another installation doesn't need to wait for."""
+        if self._caches is None or len(self._caches) < 2:
+            return False
+        token = self._token_from_request(request)
+        if token is None:
+            return False
+        with self._lock:
+            sender = next((c for c in self._caches if c._token == token), None)
+            if sender is None or sender.remaining is None or sender.remaining > _BUDGET_MIN_RESERVE:
+                return False
+            return any(c is not sender and (c.remaining is None or c.remaining > _BUDGET_MIN_RESERVE) for c in self._caches)
+
+    def _token_from_request(self, request: requests.PreparedRequest) -> Optional[str]:
+        value = request.headers.get(self.auth_header)
+        if not value or not value.startswith("token "):
+            return None
+        return value[len("token ") :].strip()
+
+    @staticmethod
+    def _header_int(response: requests.Response, header: str) -> Optional[int]:
+        value = response.headers.get(header)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     @property
     def auth_header(self) -> str:
