@@ -19,7 +19,7 @@ import time
 from dataclasses import InitVar, dataclass
 from itertools import groupby
 from os import getenv
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 from urllib.parse import urlparse
 
 import jwt
@@ -624,13 +624,8 @@ class ConfigNormalization(ConfigTransformation):
             config["repositories"] = set(filter(None, config["repository"].split(" ")))
         if not config.get("branches") and config.get("branch"):
             config["branches"] = set(filter(None, config["branch"].split(" ")))
-        # `requester_base.authenticator`'s `SelectiveAuthenticator` needs one stable key to
-        # branch on regardless of which credentials shape is in play — legacy root-level
-        # `access_token`, `credentials.access_token`/`personal_access_token`, or
-        # `credentials.github_apps`.
-        # `or {}`, not `setdefault`: `credentials` can be present and explicitly null (API,
-        # Terraform, embedded use), which `setdefault` leaves as `None` — the same pitfall as
-        # `api_url` above.
+        # One stable key for the manifest's SelectiveAuthenticator. `or {}`, not `setdefault`:
+        # `credentials` can be present and null, like `api_url` above.
         credentials = config.get("credentials") or {}
         config["credentials"] = credentials
         credentials["auth_mode"] = "github_apps" if credentials.get("github_apps") else "token"
@@ -681,35 +676,20 @@ class ApiUrlValidationStrategy(ValidationStrategy):
         raise AirbyteTracedException(message=message, failure_type=FailureType.config_error)
 
 
-# GitHub always issues installation access tokens valid for exactly 1 hour; refresh a bit early so
-# a token already handed to an in-flight request is never right at the edge of expiry.
+# Installation tokens live exactly 1 hour; refresh early so an in-flight request never holds one
+# at the edge of expiry.
 _REFRESH_MARGIN_SECONDS = 120
 _INSTALLATION_TOKEN_LIFETIME_SECONDS = 3600
 
-# Same constants as the PAT path's sticky-token behavior (RateLimitedMultipleTokenAuthenticator):
-# stick with an installation until its tracked quota drops into this reserve, then rotate.
+# Same values as RateLimitedMultipleTokenAuthenticator's reserve and MIN_EXHAUSTION_WAIT.
 _BUDGET_MIN_RESERVE = 50
-# Floor for the exhaustion wait (matches RateLimitedMultipleTokenAuthenticator.MIN_EXHAUSTION_WAIT),
-# so a stale/skewed reset timestamp can't cause a refresh busy-loop.
 _MIN_EXHAUSTION_WAIT_SECONDS = 5.0
 
 
 class _InstallationTokenCache:
-    """Mints and caches one GitHub App installation's access token, refreshing it on demand, and
-    tracks that installation's REST rate-limit quota so the authenticator can stick with it until
-    exhausted (mirroring the PAT path) instead of blindly round-robining every call.
-
-    The quota estimate is local-only — seeded from `/rate_limit` and decremented per call, never
-    reconciled against live response headers the way `RateLimitedMultipleTokenAuthenticator`
-    reconciles the PAT path's. A shared installation or concurrent syncs can drift it; the
-    accepted failure mode is an occasional real 403 that skips/fails the affected repository
-    rather than a smooth rotation, not data loss or a security issue. Deliberately simpler than
-    the PAT path for the same reason the PAT path itself is more involved than this needs to be.
-
-    Token refresh happens lazily on the next `get_token()` call once the cached token is close to
-    expiry — not once at sync startup — so a sync that runs for many hours never ends up making
-    calls with a token that died partway through.
-    """
+    """One installation's access token, minted lazily and refreshed before expiry, plus a local
+    REST-quota estimate. The estimate is seeded from `/rate_limit` and never reconciled against
+    response headers: a shared installation can drift it, at worst costing a real 403."""
 
     def __init__(self, app_id: str, installation_id: str, private_key: str, api_url: str) -> None:
         self._app_id = app_id
@@ -720,9 +700,6 @@ class _InstallationTokenCache:
         self._expires_at: float = 0.0
         self.remaining: Optional[int] = None
         self.reset_at: Optional[float] = None
-        # Guards `_token`/`_expires_at`: `get_token()` can be called concurrently for the same
-        # installation (multiple in-flight partition reads sharing one authenticator), and without
-        # this a race between the expiry check and the refresh could mint the token twice at once.
         self._token_lock = threading.Lock()
 
     def _mint_app_jwt(self) -> str:
@@ -731,11 +708,7 @@ class _InstallationTokenCache:
         try:
             return jwt.encode(payload, self._private_key, algorithm="RS256")
         except Exception as e:
-            # A malformed/garbage PEM surfaces here (e.g. PyJWT/cryptography's
-            # "Could not deserialize key data..."). Wrap it the same way the installation-token
-            # exchange's 401/403/404 are wrapped below, instead of letting a raw library
-            # exception reach the user with no actionable guidance. Neither that exception nor
-            # this message ever includes the key material itself.
+            # Neither the library error nor this message includes the key material.
             raise AirbyteTracedException(
                 message=f"GitHub App authentication failed. The private key for app_id '{self._app_id}' could not be used to "
                 "sign a JWT — please verify it is a valid, unencrypted PEM-formatted RSA private key.",
@@ -763,30 +736,23 @@ class _InstallationTokenCache:
         )
 
     def get_token(self) -> str:
-        if self._token is None or time.time() >= self._expires_at:
-            with self._token_lock:
-                # Re-check inside the lock: another thread may have refreshed while this one
-                # was waiting to acquire it, in which case minting again would be redundant.
-                if self._token is None or time.time() >= self._expires_at:
-                    self._refresh_token()
-        return self._token  # type: ignore[return-value]
+        with self._token_lock:
+            if self._token is None or time.time() >= self._expires_at:
+                self._refresh_token()
+            return self._token  # type: ignore[return-value]
 
     def refresh_quota(self) -> None:
-        """Seed `remaining`/`reset_at` from GitHub's own accounting for this installation."""
         response = requests.get(
             f"{self._api_url}/rate_limit",
             headers={"Authorization": f"token {self.get_token()}", "Accept": "application/vnd.github+json"},
             timeout=30,
         )
         if response.status_code == 404:
-            # GitHub Enterprise Server with rate limiting disabled answers 404 here (same case
-            # `requester_base.authenticator`'s `QuotaStatusSource.unavailable_status_codes: [404]`
-            # handles for the token path) — leave the pool untracked rather than raising.
+            # GHES with rate limiting disabled; same as the token path's `unavailable_status_codes`.
             self.remaining = None
             self.reset_at = None
             return
-        # 401/403 must never read as transient (same rule the manifest documents for the token
-        # path's `QuotaStatusSource`): a revoked installation token is an auth failure.
+        # 401/403 is a revoked token, never "quota tracking unavailable" (same rule as the token path).
         _check_response(response, f"rate_limit seeding for app_id={self._app_id}", config_error_statuses=(401, 403))
         core = response.json()["resources"]["core"]
         self.remaining = core["remaining"]
@@ -818,53 +784,32 @@ def _check_response(response: requests.Response, context: str, config_error_stat
 
 
 def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
-    """Parses repeated {app_id line}\\n{installation_id line}\\n{PEM block} groups, blank lines
-    between groups allowed. The PEM block is taken verbatim from its `-----BEGIN` line through
-    its `-----END` line, so a real .pem file can be pasted as-is.
-    """
-    lines = github_apps.splitlines()
-    n = len(lines)
+    """Parses repeated app_id / installation_id / PEM groups. Blank lines and surrounding
+    whitespace are ignored, so a .pem file can be pasted as-is."""
+    lines = [line.strip() for line in github_apps.splitlines() if line.strip()]
     entries: List[Tuple[str, str, str]] = []
     i = 0
-
-    def next_nonblank(i: int) -> int:
-        while i < n and not lines[i].strip():
-            i += 1
-        return i
-
-    while True:
-        i = next_nonblank(i)
-        if i >= n:
-            break
-        app_id = lines[i].strip()
-        i = next_nonblank(i + 1)
-        if i >= n:
+    while i < len(lines):
+        app_id = lines[i]
+        if i + 1 >= len(lines):
             _raise_config_error(f"credentials.github_apps: missing installation_id after app_id '{app_id}'")
-        installation_id = lines[i].strip()
-        i = next_nonblank(i + 1)
-        if i >= n or not lines[i].strip().startswith("-----BEGIN"):
+        installation_id = lines[i + 1]
+        i += 2
+        if i >= len(lines) or not lines[i].startswith("-----BEGIN"):
             _raise_config_error(
                 f"credentials.github_apps: expected a '-----BEGIN...' PEM block after installation_id '{installation_id}'"
             )
-        pem_lines = []
-        found_end = False
-        while i < n:
-            pem_lines.append(lines[i])
-            if lines[i].strip().startswith("-----END"):
-                i += 1
-                found_end = True
-                break
-            i += 1
-        if not found_end:
+        end = next((j for j in range(i, len(lines)) if lines[j].startswith("-----END")), None)
+        if end is None:
             _raise_config_error(f"credentials.github_apps: PEM block for app_id '{app_id}' never reached a '-----END...' line")
-        entries.append((app_id, installation_id, "\n".join(pem_lines)))
+        entries.append((app_id, installation_id, "\n".join(lines[i : end + 1])))
+        i = end + 1
     return entries
 
 
 class _SharedGithubAppState:
-    """Installation caches/rotation state shared by every `GithubAppMultiPemAuthenticator` for the
-    same credentials. `create_custom_component` never caches instances the way the token path's
-    authenticator is cached, so each stream's requester gets its own authenticator object."""
+    """State shared by every authenticator for the same credentials: `create_custom_component`
+    doesn't cache, so each stream's requester gets its own authenticator object."""
 
     def __init__(self) -> None:
         self.caches: Optional[List[_InstallationTokenCache]] = None
@@ -872,8 +817,7 @@ class _SharedGithubAppState:
         self.lock = threading.Lock()
 
 
-# Keyed by credentials, not by source: GitHub counts quota per installation, so two sources in one
-# process using the same installations must share one estimate.
+# Keyed by credentials, not by source: GitHub counts quota per installation.
 _shared_state_by_credentials: Dict[Tuple[str, str], _SharedGithubAppState] = {}
 _shared_state_registry_lock = threading.Lock()
 
@@ -885,39 +829,26 @@ def _get_shared_state(github_apps_value: str, api_url: str) -> _SharedGithubAppS
 
 @dataclass
 class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
-    """Authenticates as one or more GitHub App installations from `credentials.github_apps`:
-    repeated app_id/installation_id/PEM groups, each minted and refreshed independently and
-    lazily so a sync outlives any one token's ~1h lifetime. With multiple entries, mirrors
-    `RateLimitedMultipleTokenAuthenticator`'s sticky-until-exhausted rotation instead of
-    round-robining every call."""
+    """Authenticates as one or more GitHub App installations from `credentials.github_apps`, with
+    `RateLimitedMultipleTokenAuthenticator`'s sticky-until-exhausted rotation across them."""
 
     config: Mapping[str, Any]
     parameters: InitVar[Mapping[str, Any]]
-    github_apps: Union[InterpolatedString, str]
 
     def __post_init__(self, parameters: Mapping[str, Any]) -> None:
-        # `create_selective_authenticator` builds every `authenticators:` branch eagerly, so this
-        # also runs in "token" mode with `github_apps` empty — the eval below is side-effect-free
-        # (no parsing/validation/network calls), which stay deferred to `_ensure_ready`, reached
-        # only if this branch is actually selected.
-        self._github_apps_value = InterpolatedString.create(self.github_apps, parameters=parameters).eval(self.config)
-        # Same source and default as `requester_base.url_base`, so GitHub App auth works against
-        # GitHub Enterprise Server exactly like the token-based auth methods do.
+        # Also built (and discarded) in token mode, so nothing here may parse, validate or call out.
+        self._github_apps_value = (self.config.get("credentials") or {}).get("github_apps") or ""
         self._api_url = self.config.get("api_url") or "https://api.github.com"
-        # Same source, default and `is not none` null-guard as the token path's `max_wait_time`,
-        # so `check`'s `config_overrides.max_waiting_time: 1` fail-fast override applies here too.
+        # Same null-guard as the token path, so `check`'s `max_waiting_time: 1` override applies.
         max_waiting_time = self.config.get("max_waiting_time")
         self._max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
         self._state = _get_shared_state(self._github_apps_value, self._api_url)
 
     def _ensure_ready(self) -> None:
-        state = self._state
-        if state.caches is not None:
-            return
-        with state.lock:
-            if state.caches is not None:
+        with self._state.lock:
+            if self._state.caches is not None:
                 return
-            entries = _parse_entries(self._github_apps_value) if self._github_apps_value else []
+            entries = _parse_entries(self._github_apps_value)
             if not entries:
                 _raise_config_error("credentials.github_apps must have at least one app_id/installation_id/PEM group")
             caches = [
@@ -926,11 +857,11 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
             ]
             for cache in caches:
                 cache.refresh_quota()
-            state.caches = caches
+            self._state.caches = caches
 
     def _select_cache_locked(self) -> Optional[_InstallationTokenCache]:
-        """Must be called while holding `self._state.lock`. Returns the active cache with its
-        `remaining` counter already decremented, or `None` if every cache is exhausted."""
+        """Caller holds `self._state.lock`. Returns the active cache, already charged one call, or
+        `None` if every cache is exhausted."""
         state = self._state
         n = len(state.caches)
         for _ in range(n):
@@ -970,24 +901,19 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
             return self._state.caches[self._state.active_index]
 
     def __call__(self, request: requests.PreparedRequest) -> Any:
-        # Charging happens here, once per real attempt — not in `token`/`get_auth_header`, which
-        # `HttpRequester._request_headers()` also reads. GraphQL draws on its own point budget, not
-        # the REST `core` quota `remaining` tracks, so charging it would rotate or sleep on a REST
-        # budget it isn't spending.
+        # Charge here, once per real attempt: `HttpRequester` also reads the header preview. GraphQL
+        # has its own point budget, so it must not draw down the REST estimate.
         if request.url and urlparse(request.url).path.endswith("/graphql"):
             cache = self._active_cache()
         else:
             cache = self._next_available_cache()
-        request.headers[self.auth_header] = f"token {cache.get_token()}"
+        request.headers["Authorization"] = f"token {cache.get_token()}"
         return request
-
-    def get_auth_header(self) -> Mapping[str, Any]:
-        # `__call__` sets the real header on every attempt, retries included.
-        return {}
 
     @property
     def auth_header(self) -> str:
-        return "Authorization"
+        # Empty, so the inherited `get_auth_header()` preview is `{}`; `__call__` sets the header.
+        return ""
 
     @property
     def token(self) -> str:

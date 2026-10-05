@@ -94,10 +94,8 @@ def get_authenticator(source: YamlDeclarativeSource) -> DeclarativeAuthenticator
     (`components.ConfigNormalization`); every config this helper is used with is in "token"
     mode, so it resolves to the `RateLimitedMultipleTokenAuthenticator` branch.
 
-    Builds from `source._config` (the normalized config): the CDK copies the config it is given
-    at construction (`_migrate_and_transform_config`), so `auth_mode` — set in place by
-    `ConfigNormalization` — only lands on that copy, not on a caller's own config object. A
-    differently resolved config yields a different cached instance.
+    Builds from `source._config`: the CDK only shallow-copies the caller's config, so a caller's
+    dict without a `credentials` key never receives `auth_mode`.
     """
     return source._constructor.create_component(
         model_type=SelectiveAuthenticatorModel,
