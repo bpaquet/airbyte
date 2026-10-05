@@ -23,6 +23,7 @@ This page contains the setup guide and reference information for the [GitHub](ht
 **For Airbyte Open Source:**
 
 - Personal Access Token (see [Permissions and scopes](https://docs.airbyte.com/integrations/sources/github#permissions-and-scopes))
+- GitHub App(s)
 <!-- /env:oss -->
 
 ## Setup guide
@@ -57,6 +58,8 @@ Log into [GitHub](https://github.com) and then generate a [personal access token
    <!-- env:oss -->
 
    - **For Airbyte Open Source:** Authenticate with **Personal Access Token**. To generate a personal access token, log into [GitHub](https://github.com) and then generate a [personal access token](https://github.com/settings/tokens). Enter your GitHub personal access token. To load balance your API quota consumption across multiple API tokens, input multiple tokens separated with `,`.
+
+     Alternatively, authenticate with **GitHub App(s)**. Create a GitHub App under your organization's settings and install it on the repositories you want to sync, then enter its App ID, Installation ID, and private key (`.pem`) — one App per line group, repeatable for multiple Apps. Each App's access token is minted and refreshed automatically as needed, so it never goes stale mid-sync the way a pasted token would; installing several Apps also spreads requests across more than one rate-limit budget.
    <!-- /env:oss -->
 
 6. **GitHub Repositories** - Enter a list of GitHub organizations/repositories, e.g. `airbytehq/airbyte` for single repository, `airbytehq/airbyte airbytehq/another-repo` for multiple repositories. If you want to specify the organization to receive data from all its repositories, then you should specify it according to the following example: `airbytehq/*`.
@@ -288,6 +291,7 @@ Your token should have at least the `repo` scope. Depending on which streams you
 
 | Version | Date | Pull Request | Subject |
 | :----------- | :----------- | :------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2.8.0 | 2026-10-05 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Add GitHub App authentication support, with multiple installations rotating for extra rate-limit headroom |
 | 2.7.4 | 2026-09-29 | [86932](https://github.com/airbytehq/airbyte/pull/86932) | Replace custom extractors of `reviews`, `issue_reactions` and `pull_request_comment_reactions` and the custom `workflow_runs` paginator with airbyte-cdk 7.31.0 features. Records are unchanged |
 | 2.7.3 | 2026-09-29 | [87172](https://github.com/airbytehq/airbyte/pull/87172) | Update dependencies |
 | 2.7.2 | 2026-09-22 | [86497](https://github.com/airbytehq/airbyte/pull/86497) | Make the connector manifest-only on the `source-declarative-manifest` base image; `check` and the legacy `repository`/`branch` config migrations now run from the manifest. Restore the GraphQL page size of `reviews`, `issue_reactions` and `pull_request_comment_reactions` to 100 and stop reading the deprecated `page_size_for_large_streams` setting, so the six large streams always use 10 |
