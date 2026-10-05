@@ -45,10 +45,7 @@ definitions:
     url_base: "{{ config.get('api_url', 'https://api.github.com').rstrip('/') }}"
     authenticator:
       type: SelectiveAuthenticator
-      # `components.ConfigNormalization` derives `credentials.auth_mode` ("token" or
-      # "github_apps") from whichever credentials shape the config actually uses — legacy
-      # root-level `access_token`, `credentials.access_token`/`personal_access_token`, or
-      # `credentials.github_apps` — so this selects on one stable key regardless of config shape.
+      # Derived by `components.ConfigNormalization` from whichever credentials shape is present.
       authenticator_selection_path: ["credentials", "auth_mode"]
       authenticators:
         token:
@@ -56,13 +53,8 @@ definitions:
           # Token precedence: legacy root-level `access_token` first, then
           # `credentials.access_token`, then `credentials.personal_access_token` — the
           # legacy `get_access_token` accepted all three, so the authenticator does too.
-          #
-          # `ModelToComponentFactory.create_selective_authenticator` builds every branch under
-          # `authenticators:` eagerly, not just the selected one, so this branch is constructed
-          # even in github_apps mode — and it requires a non-empty `tokens` list to construct at
-          # all. The placeholder below is substituted whenever github_apps mode is active; this
-          # branch is then discarded, never used, and its quota seeding is lazy (on first use),
-          # so the placeholder never makes a real request.
+          # SelectiveAuthenticator builds every branch eagerly and this one needs a non-empty
+          # token list, hence the never-used placeholder in github_apps mode.
           tokens: "{{ 'unused-placeholder-token' if config.get('credentials', {}).get('auth_mode') == 'github_apps' else config.get('access_token', config.get('credentials', {}).get('access_token', config.get('credentials', {}).get('personal_access_token', ''))) }}"
           token_delimiter: ","
           auth_method: "token"
@@ -135,7 +127,6 @@ definitions:
         github_apps:
           type: CustomAuthenticator
           class_name: source_declarative_manifest.components.GithubAppMultiPemAuthenticator
-          github_apps: "{{ config.get('credentials', {}).get('github_apps', '') }}"
     request_headers:
       User-Agent: "PostmanRuntime/7.28.0"
     error_handler:
@@ -349,8 +340,8 @@ definitions:
     action: FAIL
     failure_type: config_error
     error_message: >-
-      GitHub authentication failed (HTTP 401). Please verify your Personal Access Token or OAuth
-      credentials are valid and not expired.
+      GitHub authentication failed (HTTP 401). Please verify your Personal Access Token, OAuth
+      or GitHub App credentials are valid and not expired.
 
   retry_after_rate_limit_filter:
     type: HttpResponseFilter
