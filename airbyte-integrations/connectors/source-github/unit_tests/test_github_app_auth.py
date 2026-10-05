@@ -17,7 +17,7 @@ from airbyte_cdk.sources.declarative.models.declarative_component_schema import 
     SelectiveAuthenticator as SelectiveAuthenticatorModel,
 )
 from airbyte_cdk.utils import AirbyteTracedException
-from components import GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries
+from components import GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries, _shared_state_by_credentials
 
 from .utils import make_source
 
@@ -72,6 +72,15 @@ def _mock_jwt(monkeypatch):
     # Signing a real JWT needs a real RSA key; we only test our own usage of PyJWT, not PyJWT
     # itself, so stub it out with a deterministic fake.
     monkeypatch.setattr("components.jwt.encode", lambda payload, key, algorithm: "fake-app-jwt")
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_state():
+    # State is shared per credentials, and nearly every test here reuses the same fixture
+    # app_id/installation_id/PEM.
+    _shared_state_by_credentials.clear()
+    yield
+    _shared_state_by_credentials.clear()
 
 
 class TestParseEntries:
@@ -349,11 +358,11 @@ class TestMaxWaitingTimeOverride:
 
     def test_defaults_to_120_minutes_when_absent(self):
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps="")
-        assert authenticator._state.max_wait_seconds == 120 * 60
+        assert authenticator._max_wait_seconds == 120 * 60
 
     def test_respects_a_configured_value(self):
         authenticator = GithubAppMultiPemAuthenticator(config={"max_waiting_time": 5}, parameters={}, github_apps="")
-        assert authenticator._state.max_wait_seconds == 5 * 60
+        assert authenticator._max_wait_seconds == 5 * 60
 
 
 class TestGitHubEnterpriseServerApiUrl:
@@ -458,26 +467,21 @@ class TestSharedStateAcrossStreams:
         _sign(first)  # ...but charging quota through one must be visible to the other.
         assert second._state.caches[0].remaining == 4999
 
-    def test_authenticators_built_from_different_sources_do_not_share_state(self, requests_mock):
-        """Symmetric check: sharing is scoped to one source's config, not global — otherwise
-        distinct sources configured with the same installation would corrupt each other's quota
-        tracking (and every test in this module reusing app_id `111`/installation_id `222` would
-        bleed into every other test)."""
+    def test_sources_using_the_same_installations_share_quota_state(self, requests_mock):
+        """GitHub counts quota per installation, so two sources in one process configured with the
+        same installations must draw down one shared estimate, not two independent ones."""
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+
         def _fresh_config():
             return {"credentials": {"github_apps": _github_apps_field(("111", "222", FAKE_PEM))}, "repositories": ["org/repo"]}
 
-        first_source = make_source(catalog=None, config=_fresh_config(), state=None)
-        second_source = make_source(catalog=None, config=_fresh_config(), state=None)
-
-        first = _selective_authenticator_from_source(first_source)
-        second = _selective_authenticator_from_source(second_source)
+        first = _selective_authenticator_from_source(make_source(catalog=None, config=_fresh_config(), state=None))
+        second = _selective_authenticator_from_source(make_source(catalog=None, config=_fresh_config(), state=None))
 
         _sign(first)
-        second.token  # side-effect-free: forces _ensure_ready() without charging, so it can be checked below
-        assert first._state.caches[0].remaining == 4999
-        assert second._state.caches[0].remaining == 5000
+        assert second._state is first._state
+        assert second._state.caches[0].remaining == 4999
 
 
 class TestUnexpectedHttpErrorsAreClassified:
@@ -515,28 +519,27 @@ class TestUnexpectedHttpErrorsAreClassified:
 
 
 class TestSingleChargePerRequest:
-    """`HttpRequester._request_headers()` reads the `token` property once, as a header preview,
-    before `HttpClient` invokes `__call__` (via `Session.prepare_request()` -> `prepare_auth()`)
-    for the actual send. Quota must be charged exactly once per real attempt, from `__call__`
-    alone — not from `token`, which fires an extra time per request."""
+    """`HttpRequester._request_headers()` reads `get_auth_header()` before `HttpClient` invokes
+    `__call__` for the actual send; quota must be charged once per real attempt, from `__call__`."""
 
-    def test_reading_token_as_a_preview_does_not_charge_quota(self, requests_mock):
+    def test_header_preview_is_empty_and_call_charges_once(self, requests_mock):
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
 
-        for _ in range(3):
-            assert authenticator.token == "token ghs_a"
-
-        assert authenticator._state.caches[0].remaining == 5000
-
-    def test_call_charges_quota_exactly_once_per_invocation(self, requests_mock):
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-
-        # The realistic sequence for one HTTP attempt: a `token` preview read, then the real send.
-        authenticator.token
-        _sign(authenticator)
-
+        assert authenticator.get_auth_header() == {}
+        assert _sign(authenticator) == "token ghs_a"
         assert authenticator._state.caches[0].remaining == 4999
+
+    def test_graphql_requests_are_not_charged_to_the_rest_quota(self, requests_mock):
+        """GraphQL has its own point budget; charging it to the REST `core` estimate would rotate or
+        sleep on a budget the request isn't spending."""
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+
+        request = requests.Request("POST", "https://api.github.com/graphql").prepare()
+        authenticator(request)
+
+        assert request.headers["Authorization"] == "token ghs_a"
+        assert authenticator._state.caches[0].remaining == 5000

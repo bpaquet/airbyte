@@ -752,13 +752,7 @@ class _InstallationTokenCache:
             },
             timeout=30,
         )
-        if response.status_code in (401, 403, 404):
-            raise AirbyteTracedException(
-                message="GitHub App authentication failed. Please verify the app_id, installation_id and private key are correct.",
-                internal_message=f"Installation token exchange failed for app_id={self._app_id}: {response.status_code} {response.text}",
-                failure_type=FailureType.config_error,
-            )
-        _raise_for_status_as_transient_error(response, f"installation token exchange for app_id={self._app_id}")
+        _check_response(response, f"installation token exchange for app_id={self._app_id}", config_error_statuses=(401, 403, 404))
         self._token = response.json()["token"]
         self._expires_at = time.time() + _INSTALLATION_TOKEN_LIFETIME_SECONDS - _REFRESH_MARGIN_SECONDS
         LOGGER.info(
@@ -791,16 +785,9 @@ class _InstallationTokenCache:
             self.remaining = None
             self.reset_at = None
             return
-        if response.status_code in (401, 403):
-            # Never classify as transient (same rule the manifest documents for the token path's
-            # `QuotaStatusSource`): a revoked installation token must read as an auth failure, not
-            # as "quota tracking unavailable."
-            raise AirbyteTracedException(
-                message="GitHub App authentication failed. Please verify the app_id, installation_id and private key are correct.",
-                internal_message=f"rate_limit seeding failed for app_id={self._app_id}: {response.status_code} {response.text}",
-                failure_type=FailureType.config_error,
-            )
-        _raise_for_status_as_transient_error(response, f"rate_limit seeding for app_id={self._app_id}")
+        # 401/403 must never read as transient (same rule the manifest documents for the token
+        # path's `QuotaStatusSource`): a revoked installation token is an auth failure.
+        _check_response(response, f"rate_limit seeding for app_id={self._app_id}", config_error_statuses=(401, 403))
         core = response.json()["resources"]["core"]
         self.remaining = core["remaining"]
         self.reset_at = core["reset"]
@@ -810,17 +797,22 @@ def _raise_config_error(message: str) -> None:
     raise AirbyteTracedException(message=message, internal_message=message, failure_type=FailureType.config_error)
 
 
-def _raise_for_status_as_transient_error(response: requests.Response, context: str) -> None:
-    """Like `response.raise_for_status()`, but classified: an unexpected status (a GitHub/GHES
-    5xx, not one of the config-error codes already handled above) must surface as
-    `failure_type=transient_error`, the same classification the token path's CDK-managed error
-    handling gives an equivalent blip, rather than an unclassified raw `requests.HTTPError`."""
+def _check_response(response: requests.Response, context: str, config_error_statuses: Tuple[int, ...]) -> None:
+    """`raise_for_status()`, classified: `config_error_statuses` are credential problems, anything
+    else unexpected (a GitHub/GHES 5xx) is `transient_error` rather than a raw `HTTPError`."""
+    internal_message = f"Unexpected status during {context}: {response.status_code} {response.text}"
+    if response.status_code in config_error_statuses:
+        raise AirbyteTracedException(
+            message="GitHub App authentication failed. Please verify the app_id, installation_id and private key are correct.",
+            internal_message=internal_message,
+            failure_type=FailureType.config_error,
+        )
     try:
         response.raise_for_status()
     except requests.exceptions.HTTPError as e:
         raise AirbyteTracedException(
             message="GitHub App authentication failed due to a temporary GitHub error. This is usually transient; please retry.",
-            internal_message=f"Unexpected status during {context}: {response.status_code} {response.text}",
+            internal_message=internal_message,
             failure_type=FailureType.transient_error,
         ) from e
 
@@ -870,34 +862,25 @@ def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
 
 
 class _SharedGithubAppState:
-    """Installation caches/rotation state shared by every `GithubAppMultiPemAuthenticator` built
-    for one config — `create_custom_component` has no per-source cache the way the token path's
-    authenticator does (see `_get_shared_state`), so this stands in for one."""
+    """Installation caches/rotation state shared by every `GithubAppMultiPemAuthenticator` for the
+    same credentials. `create_custom_component` never caches instances the way the token path's
+    authenticator is cached, so each stream's requester gets its own authenticator object."""
 
-    def __init__(self, max_wait_seconds: float) -> None:
-        self.max_wait_seconds = max_wait_seconds
+    def __init__(self) -> None:
         self.caches: Optional[List[_InstallationTokenCache]] = None
         self.active_index = 0
         self.lock = threading.Lock()
 
 
-# Keyed by `id(config)` plus a strong reference to `config` (a plain `dict`, so it can't be a
-# `weakref`/`WeakKeyDictionary` key): the reference is what keeps the `is not config` check below
-# sound, since CPython can only reuse a freed object's id, never one still referenced. Entries
-# accumulate for the process's lifetime — harmless for one-sync-per-process deployments (every
-# published connector image), a slow leak for a long-lived host building many sources (PyAirbyte,
-# Connector Builder's test panel), which this connector hasn't needed to solve before.
-_shared_state_by_config_id: Dict[int, Tuple[Mapping[str, Any], _SharedGithubAppState]] = {}
+# Keyed by credentials, not by source: GitHub counts quota per installation, so two sources in one
+# process using the same installations must share one estimate.
+_shared_state_by_credentials: Dict[Tuple[str, str], _SharedGithubAppState] = {}
 _shared_state_registry_lock = threading.Lock()
 
 
-def _get_shared_state(config: Mapping[str, Any], max_wait_seconds: float) -> _SharedGithubAppState:
+def _get_shared_state(github_apps_value: str, api_url: str) -> _SharedGithubAppState:
     with _shared_state_registry_lock:
-        entry = _shared_state_by_config_id.get(id(config))
-        if entry is None or entry[0] is not config:
-            entry = (config, _SharedGithubAppState(max_wait_seconds))
-            _shared_state_by_config_id[id(config)] = entry
-        return entry[1]
+        return _shared_state_by_credentials.setdefault((github_apps_value, api_url), _SharedGithubAppState())
 
 
 @dataclass
@@ -917,18 +900,15 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
         # also runs in "token" mode with `github_apps` empty — the eval below is side-effect-free
         # (no parsing/validation/network calls), which stay deferred to `_ensure_ready`, reached
         # only if this branch is actually selected.
-        github_apps_value = InterpolatedString.create(self.github_apps, parameters=parameters).eval(self.config)
+        self._github_apps_value = InterpolatedString.create(self.github_apps, parameters=parameters).eval(self.config)
         # Same source and default as `requester_base.url_base`, so GitHub App auth works against
         # GitHub Enterprise Server exactly like the token-based auth methods do.
-        api_url = self.config.get("api_url") or "https://api.github.com"
+        self._api_url = self.config.get("api_url") or "https://api.github.com"
         # Same source, default and `is not none` null-guard as the token path's `max_wait_time`,
-        # so `check`'s `config_overrides.max_waiting_time: 1` fail-fast override applies here too
-        # instead of this authenticator always waiting up to a hardcoded 2-hour ceiling.
+        # so `check`'s `config_overrides.max_waiting_time: 1` fail-fast override applies here too.
         max_waiting_time = self.config.get("max_waiting_time")
-        max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
-        self._github_apps_value = github_apps_value
-        self._api_url = api_url
-        self._state = _get_shared_state(self.config, max_wait_seconds)
+        self._max_wait_seconds = (max_waiting_time if max_waiting_time is not None else 120) * 60
+        self._state = _get_shared_state(self._github_apps_value, self._api_url)
 
     def _ensure_ready(self) -> None:
         state = self._state
@@ -972,7 +952,7 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                     return cache
                 wait_seconds = max(min(c.reset_at for c in state.caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
 
-                if wait_seconds > state.max_wait_seconds:
+                if wait_seconds > self._max_wait_seconds:
                     raise AirbyteTracedException(
                         message="Rate limit exceeded for all configured GitHub App installations.",
                         failure_type=FailureType.transient_error,
@@ -984,16 +964,26 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 for cache in state.caches:
                     cache.refresh_quota()
 
+    def _active_cache(self) -> _InstallationTokenCache:
+        self._ensure_ready()
+        with self._state.lock:
+            return self._state.caches[self._state.active_index]
+
     def __call__(self, request: requests.PreparedRequest) -> Any:
-        """The real signing path. `HttpRequester._request_headers()` already reads the `token`
-        property once, as a header preview, before `HttpClient` invokes this (via
-        `Session.prepare_request()` -> `prepare_auth()`) for the actual send — so the quota
-        charge/rotation decision must live here, the one call per real attempt, not in `token`,
-        or every installation's estimate would be decremented twice per request.
-        """
-        cache = self._next_available_cache()
+        # Charging happens here, once per real attempt — not in `token`/`get_auth_header`, which
+        # `HttpRequester._request_headers()` also reads. GraphQL draws on its own point budget, not
+        # the REST `core` quota `remaining` tracks, so charging it would rotate or sleep on a REST
+        # budget it isn't spending.
+        if request.url and urlparse(request.url).path.endswith("/graphql"):
+            cache = self._active_cache()
+        else:
+            cache = self._next_available_cache()
         request.headers[self.auth_header] = f"token {cache.get_token()}"
         return request
+
+    def get_auth_header(self) -> Mapping[str, Any]:
+        # `__call__` sets the real header on every attempt, retries included.
+        return {}
 
     @property
     def auth_header(self) -> str:
@@ -1001,10 +991,4 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
 
     @property
     def token(self) -> str:
-        """Side-effect-free preview for `HttpRequester._request_headers()`: the currently active
-        installation's token, with no selection/rotation/decrement — `__call__` runs again right
-        before the request is actually sent and overwrites this value."""
-        self._ensure_ready()
-        with self._state.lock:
-            cache = self._state.caches[self._state.active_index]
-        return f"token {cache.get_token()}"
+        return ""
