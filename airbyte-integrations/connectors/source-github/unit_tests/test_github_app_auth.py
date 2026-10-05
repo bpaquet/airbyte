@@ -6,6 +6,7 @@ import threading
 
 import jwt
 import pytest
+import requests
 from freezegun import freeze_time
 
 from airbyte_cdk.models import FailureType
@@ -188,7 +189,7 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 0, "reset": 1000}}}},
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 1030}}}},
                 {"json": {"resources": {"core": {"remaining": 0, "reset": 2000}}}},
                 {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
                 {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
@@ -202,7 +203,25 @@ class TestStickyRotation:
         )
         token = authenticator.token
         assert token in ("token ghs_a", "token ghs_b")
-        assert sleeps == [1.0]  # earliest reset (1000) minus frozen "now" (999)
+        assert sleeps == [31.0]  # earliest reset (1030) minus frozen "now" (999)
+
+    def test_all_exhausted_wait_is_floored_against_a_stale_reset(self, requests_mock, monkeypatch):
+        """A reset timestamp at or behind "now" (clock skew, or read right at the boundary)
+        must not collapse the wait to ~0 and busy-loop re-querying /rate_limit."""
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get(
+            "https://api.github.com/rate_limit",
+            [
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 999}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
+            ],
+        )
+        sleeps = []
+        monkeypatch.setattr("components.time.sleep", lambda seconds: sleeps.append(seconds))
+        monkeypatch.setattr("components.time.time", lambda: 999.0)
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        authenticator.token
+        assert sleeps == [5.0]  # floored to _MIN_EXHAUSTION_WAIT_SECONDS, not the raw 0.0
 
 
 class TestMintAppJwtErrors:
@@ -210,7 +229,7 @@ class TestMintAppJwtErrors:
         # Override the module-level autouse stub for this test only, so `_mint_app_jwt` exercises
         # the real PyJWT/cryptography failure it is meant to wrap.
         monkeypatch.setattr("components.jwt.encode", _REAL_JWT_ENCODE)
-        cache = _InstallationTokenCache(app_id="111", installation_id="222", private_key="not a real pem")
+        cache = _InstallationTokenCache(app_id="111", installation_id="222", private_key="not a real pem", api_url="https://api.github.com")
         with pytest.raises(AirbyteTracedException) as exc_info:
             cache._mint_app_jwt()
         assert exc_info.value.failure_type == FailureType.config_error
@@ -272,6 +291,108 @@ class TestConcurrency:
             t.join()
 
         assert rate_limit_mock.call_count == 1
+
+
+class TestGitHubEnterpriseServerApiUrl:
+    def test_installation_token_and_rate_limit_use_configured_api_url(self, requests_mock):
+        """GitHub App auth must work against GHES like the token-based auth methods do, instead
+        of always hitting public GitHub regardless of `api_url`."""
+        ghes_token_mock = requests_mock.post(
+            "https://github.company.org/api/v3/app/installations/222/access_tokens", json={"token": "ghs_a"}
+        )
+        ghes_quota_mock = requests_mock.get(
+            "https://github.company.org/api/v3/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}
+        )
+        authenticator = GithubAppMultiPemAuthenticator(
+            config={"api_url": "https://github.company.org/api/v3/"},
+            parameters={},
+            github_apps=_github_apps_field(("111", "222", FAKE_PEM)),
+        )
+        assert authenticator.token == "token ghs_a"
+        assert ghes_token_mock.called
+        assert ghes_quota_mock.called
+
+    def test_defaults_to_public_github_when_api_url_is_absent(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        assert authenticator.token == "token ghs_a"
+
+
+class TestResponseAwareReconciliation:
+    def _prepared_request(self, token):
+        request = requests.Request("GET", "https://api.github.com/repos/org/repo").prepare()
+        request.headers["Authorization"] = f"token {token}"
+        return request
+
+    def _response(self, status_code=200, remaining=None, reset=None):
+        response = requests.Response()
+        response.status_code = status_code
+        if remaining is not None:
+            response.headers["X-RateLimit-Remaining"] = str(remaining)
+        if reset is not None:
+            response.headers["X-RateLimit-Reset"] = str(reset)
+        return response
+
+    def test_update_from_response_tightens_the_local_estimate(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        authenticator._ensure_ready()
+        cache = authenticator._caches[0]
+
+        authenticator.update_from_response(self._prepared_request("ghs_a"), self._response(remaining=42, reset=4070908800))
+
+        assert cache.remaining == 42
+
+    def test_update_from_response_ignores_an_unrelated_token(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        authenticator._ensure_ready()
+        cache = authenticator._caches[0]
+
+        authenticator.update_from_response(self._prepared_request("some-other-token"), self._response(remaining=0, reset=4070908800))
+
+        assert cache.remaining == 5000
+
+    def test_update_from_response_adopts_a_fresh_window(self, requests_mock):
+        """A later reset is a new window; the response's count describes it, not a stale local one."""
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 1, "reset": 1000}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        authenticator._ensure_ready()
+        cache = authenticator._caches[0]
+
+        authenticator.update_from_response(self._prepared_request("ghs_a"), self._response(remaining=5000, reset=2000))
+
+        assert (cache.remaining, cache.reset_at) == (5000, 2000)
+
+    def test_has_alternative_token_true_when_sender_exhausted_and_another_has_quota(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        requests_mock.get(
+            "https://api.github.com/rate_limit",
+            [
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
+            ],
+        )
+        authenticator = GithubAppMultiPemAuthenticator(
+            config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
+        )
+        authenticator._ensure_ready()
+        authenticator._caches[0].remaining = 0
+
+        assert authenticator.has_alternative_token(self._prepared_request("ghs_a")) is True
+
+    def test_has_alternative_token_false_when_only_one_installation(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 0, "reset": 4070908800}}})
+        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
+        authenticator._ensure_ready()
+
+        assert authenticator.has_alternative_token(self._prepared_request("ghs_a")) is False
 
 
 class TestManifestWiring:
