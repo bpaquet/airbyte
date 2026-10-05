@@ -19,7 +19,7 @@ import time
 from dataclasses import InitVar, dataclass
 from itertools import groupby
 from os import getenv
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import jwt
@@ -693,17 +693,18 @@ _BUDGET_MIN_RESERVE = 50
 # so a stale/skewed reset timestamp can't cause a refresh busy-loop.
 _MIN_EXHAUSTION_WAIT_SECONDS = 5.0
 
-# GitHub Apps get the same two independent budgets as a PAT/OAuth token (see the `rest`/`graphql`
-# `TokenQuota` pools on `requester_base.authenticator`), so each installation tracks both rather
-# than blending GraphQL response headers into the REST count or vice versa.
-_REST_POOL = "rest"
-_GRAPHQL_POOL = "graphql"
-
 
 class _InstallationTokenCache:
     """Mints and caches one GitHub App installation's access token, refreshing it on demand, and
-    tracks that installation's REST and GraphQL rate-limit quotas so the authenticator can stick
-    with it until exhausted (mirroring the PAT path) instead of blindly round-robining every call.
+    tracks that installation's REST rate-limit quota so the authenticator can stick with it until
+    exhausted (mirroring the PAT path) instead of blindly round-robining every call.
+
+    The quota estimate is local-only — seeded from `/rate_limit` and decremented per call, never
+    reconciled against live response headers the way `RateLimitedMultipleTokenAuthenticator`
+    reconciles the PAT path's. A shared installation or concurrent syncs can drift it; the
+    accepted failure mode is an occasional real 403 that skips/fails the affected repository
+    rather than a smooth rotation, not data loss or a security issue. Deliberately simpler than
+    the PAT path for the same reason the PAT path itself is more involved than this needs to be.
 
     Token refresh happens lazily on the next `get_token()` call once the cached token is close to
     expiry — not once at sync startup — so a sync that runs for many hours never ends up making
@@ -717,8 +718,8 @@ class _InstallationTokenCache:
         self._api_url = api_url.rstrip("/")
         self._token: Optional[str] = None
         self._expires_at: float = 0.0
-        self.remaining: Dict[str, Optional[int]] = {_REST_POOL: None, _GRAPHQL_POOL: None}
-        self.reset_at: Dict[str, Optional[float]] = {_REST_POOL: None, _GRAPHQL_POOL: None}
+        self.remaining: Optional[int] = None
+        self.reset_at: Optional[float] = None
         # Guards `_token`/`_expires_at`: `get_token()` can be called concurrently for the same
         # installation (multiple in-flight partition reads sharing one authenticator), and without
         # this a race between the expiry check and the refresh could mint the token twice at once.
@@ -777,8 +778,7 @@ class _InstallationTokenCache:
         return self._token  # type: ignore[return-value]
 
     def refresh_quota(self) -> None:
-        """Seed both pools' `remaining`/`reset_at` from GitHub's own accounting for this
-        installation."""
+        """Seed `remaining`/`reset_at` from GitHub's own accounting for this installation."""
         response = requests.get(
             f"{self._api_url}/rate_limit",
             headers={"Authorization": f"token {self.get_token()}", "Accept": "application/vnd.github+json"},
@@ -787,14 +787,14 @@ class _InstallationTokenCache:
         if response.status_code == 404:
             # GitHub Enterprise Server with rate limiting disabled answers 404 here (same case
             # `requester_base.authenticator`'s `QuotaStatusSource.unavailable_status_codes: [404]`
-            # handles for the token path) — leave both pools untracked rather than raising.
-            self.remaining = {_REST_POOL: None, _GRAPHQL_POOL: None}
-            self.reset_at = {_REST_POOL: None, _GRAPHQL_POOL: None}
+            # handles for the token path) — leave the pool untracked rather than raising.
+            self.remaining = None
+            self.reset_at = None
             return
         response.raise_for_status()
-        resources = response.json()["resources"]
-        self.remaining = {_REST_POOL: resources["core"]["remaining"], _GRAPHQL_POOL: resources["graphql"]["remaining"]}
-        self.reset_at = {_REST_POOL: resources["core"]["reset"], _GRAPHQL_POOL: resources["graphql"]["reset"]}
+        core = response.json()["resources"]["core"]
+        self.remaining = core["remaining"]
+        self.reset_at = core["reset"]
 
 
 def _raise_config_error(message: str) -> None:
@@ -894,29 +894,27 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 cache.refresh_quota()
             self._caches = caches
 
-    def _select_cache_locked(self, pool: str) -> Optional[_InstallationTokenCache]:
+    def _select_cache_locked(self) -> Optional[_InstallationTokenCache]:
         """Must be called while holding `self._lock`. Returns the active cache with its
-        `remaining[pool]` counter already decremented, or `None` if every cache is exhausted
-        for that pool."""
+        `remaining` counter already decremented, or `None` if every cache is exhausted."""
         n = len(self._caches)
         for _ in range(n):
             cache = self._caches[self._active_index]
-            remaining = cache.remaining[pool]
-            if remaining is None or remaining > _BUDGET_MIN_RESERVE:
-                if remaining is not None:
-                    cache.remaining[pool] -= 1
+            if cache.remaining is None or cache.remaining > _BUDGET_MIN_RESERVE:
+                if cache.remaining is not None:
+                    cache.remaining -= 1
                 return cache
             self._active_index = (self._active_index + 1) % n
         return None
 
-    def _next_available_cache(self, pool: str) -> _InstallationTokenCache:
+    def _next_available_cache(self) -> _InstallationTokenCache:
         self._ensure_ready()
         while True:
             with self._lock:
-                cache = self._select_cache_locked(pool)
+                cache = self._select_cache_locked()
                 if cache is not None:
                     return cache
-                wait_seconds = max(min(c.reset_at[pool] for c in self._caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
+                wait_seconds = max(min(c.reset_at for c in self._caches) - time.time(), _MIN_EXHAUSTION_WAIT_SECONDS)
 
                 if wait_seconds > self._max_wait_seconds:
                     raise AirbyteTracedException(
@@ -930,98 +928,11 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 for cache in self._caches:
                     cache.refresh_quota()
 
-    def __call__(self, request: requests.PreparedRequest) -> Any:
-        """Sign the request, picking the installation from the pool (`rest`/`graphql`) the
-        request's URL actually belongs to — the generic `token`/`auth_header` property pair
-        `AbstractHeaderAuthenticator.__call__` would otherwise use has no request to key off of."""
-        pool = self._pool_for_request(request)
-        cache = self._next_available_cache(pool)
-        request.headers[self.auth_header] = f"token {cache.get_token()}"
-        return request
-
-    @staticmethod
-    def _pool_for_request(request: requests.PreparedRequest) -> str:
-        return _GRAPHQL_POOL if request.url and "/graphql" in urlparse(request.url).path else _REST_POOL
-
-    def update_from_response(self, request: requests.PreparedRequest, response: requests.Response) -> None:
-        """Reconcile the sending installation's matched-pool counters against what GitHub
-        reported.
-
-        Implements `ResponseAwareAuthenticator` (airbyte_cdk.sources.streams.http
-        .requests_native_auth.protocols), dispatched structurally — `HttpClient` calls this on
-        every response. Simpler than `RateLimitedMultipleTokenAuthenticator.update_from_response`:
-        no window-rollover/limit tracking.
-        """
-        if self._caches is None:
-            return
-        token = self._token_from_request(request)
-        if token is None:
-            return
-        pool = self._pool_for_request(request)
-        remaining = self._header_int(response, "X-RateLimit-Remaining")
-        reset_at = self._header_int(response, "X-RateLimit-Reset")
-        if remaining is None and reset_at is None:
-            return
-        with self._lock:
-            cache = next((c for c in self._caches if c._token == token), None)
-            if cache is None:
-                return
-            cache_reset_at = cache.reset_at[pool]
-            if reset_at is not None and (cache_reset_at is None or reset_at > cache_reset_at):
-                # A later reset means a fresh window; the response's own remaining count (or a
-                # full unknown-limit retreat to None) describes it, not the stale local one.
-                cache.reset_at[pool] = reset_at
-                cache.remaining[pool] = remaining
-            elif remaining is not None:
-                # Same window: only ever tighten the estimate, never loosen it from a
-                # possibly-reordered response.
-                cache_remaining = cache.remaining[pool]
-                cache.remaining[pool] = remaining if cache_remaining is None else min(cache_remaining, remaining)
-
-    def has_alternative_token(self, request: requests.PreparedRequest) -> bool:
-        """Implements `TokenRotatingAuthenticator`: whether a different installation could serve
-        this request's pool right now, so `HttpClient` retries promptly instead of sleeping out a
-        window another installation doesn't need to wait for."""
-        if self._caches is None or len(self._caches) < 2:
-            return False
-        token = self._token_from_request(request)
-        if token is None:
-            return False
-        pool = self._pool_for_request(request)
-        with self._lock:
-            sender = next((c for c in self._caches if c._token == token), None)
-            if sender is None:
-                return False
-            sender_remaining = sender.remaining[pool]
-            if sender_remaining is None or sender_remaining > _BUDGET_MIN_RESERVE:
-                return False
-            return any(
-                c is not sender and (c.remaining[pool] is None or c.remaining[pool] > _BUDGET_MIN_RESERVE) for c in self._caches
-            )
-
-    def _token_from_request(self, request: requests.PreparedRequest) -> Optional[str]:
-        value = request.headers.get(self.auth_header)
-        if not value or not value.startswith("token "):
-            return None
-        return value[len("token ") :].strip()
-
-    @staticmethod
-    def _header_int(response: requests.Response, header: str) -> Optional[int]:
-        value = response.headers.get(header)
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
     @property
     def auth_header(self) -> str:
         return "Authorization"
 
     @property
     def token(self) -> str:
-        """Convenience accessor (tests, introspection). Real request signing goes through
-        `__call__`, which is pool-aware; this always charges the `rest` pool."""
-        cache = self._next_available_cache(_REST_POOL)
+        cache = self._next_available_cache()
         return f"token {cache.get_token()}"
