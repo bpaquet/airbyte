@@ -17,7 +17,7 @@ from airbyte_cdk.sources.declarative.models.declarative_component_schema import 
     SelectiveAuthenticator as SelectiveAuthenticatorModel,
 )
 from airbyte_cdk.utils import AirbyteTracedException
-from components import _GRAPHQL_POOL, _REST_POOL, GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries
+from components import GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries
 
 from .utils import make_source
 
@@ -90,7 +90,7 @@ class TestParseEntries:
 class TestInstallationTokenMintingAndCaching:
     def test_mints_once_and_caches(self, requests_mock):
         mint_mock = requests_mock.post(_access_token_url("222"), json={"token": "ghs_abc"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
         authenticator._ensure_ready()  # lazy: entries are only parsed/seeded on first actual use
         cache = authenticator._caches[0]
@@ -100,7 +100,7 @@ class TestInstallationTokenMintingAndCaching:
 
     def test_refreshes_after_expiry(self, requests_mock):
         requests_mock.post(_access_token_url("222"), [{"json": {"token": "ghs_first"}}, {"json": {"token": "ghs_second"}}])
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         with freeze_time("2026-01-01T00:00:00Z") as frozen:
             authenticator = GithubAppMultiPemAuthenticator(
                 config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM))
@@ -126,8 +126,8 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
             ],
         )
         authenticator = GithubAppMultiPemAuthenticator(
@@ -143,8 +143,8 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
             ],
         )
         authenticator = GithubAppMultiPemAuthenticator(
@@ -165,10 +165,10 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
             ],
         )
         authenticator = GithubAppMultiPemAuthenticator(
@@ -192,10 +192,10 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 0, "reset": 1030}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 0, "reset": 2000}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 1030}}}},
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 2000}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
             ],
         )
         sleeps = []
@@ -215,8 +215,8 @@ class TestStickyRotation:
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
-                {"json": {"resources": {"core": {"remaining": 0, "reset": 999}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 999}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
             ],
         )
         sleeps = []
@@ -254,7 +254,7 @@ class TestConcurrency:
         seeded = total_calls + 1000  # comfortably above the reserve for the whole run: no rotation/waits involved
         requests_mock.get(
             "https://api.github.com/rate_limit",
-            json={"resources": {"core": {"remaining": seeded, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}},
+            json={"resources": {"core": {"remaining": seeded, "reset": 4070908800}}},
         )
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
 
@@ -271,7 +271,7 @@ class TestConcurrency:
         for t in threads:
             t.join()
 
-        assert authenticator._caches[0].remaining[_REST_POOL] == seeded - total_calls
+        assert authenticator._caches[0].remaining == seeded - total_calls
 
     def test_concurrent_first_use_seeds_quota_once(self, requests_mock):
         """Regression test for double-checked locking in `_ensure_ready`: concurrent first calls
@@ -279,7 +279,7 @@ class TestConcurrency:
         """
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         rate_limit_mock = requests_mock.get(
-            "https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}
+            "https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}
         )
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
 
@@ -301,15 +301,15 @@ class TestConcurrency:
 
 class TestGitHubEnterpriseServerRateLimitingDisabled:
     def test_refresh_quota_treats_404_as_untracked(self, requests_mock):
-        """GHES with rate limiting disabled answers `/rate_limit` with 404 — must leave both
-        pools untracked (never exhausted) instead of raising and crashing check/sync, mirroring
+        """GHES with rate limiting disabled answers `/rate_limit` with 404 — must leave the pool
+        untracked (never exhausted) instead of raising and crashing check/sync, mirroring
         `requester_base.authenticator`'s `QuotaStatusSource.unavailable_status_codes: [404]`."""
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get("https://api.github.com/rate_limit", status_code=404, json={"message": "Rate limiting is not enabled."})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
 
         assert authenticator.token == "token ghs_a"
-        assert authenticator._caches[0].remaining == {_REST_POOL: None, _GRAPHQL_POOL: None}
+        assert authenticator._caches[0].remaining is None
 
 
 class TestMaxWaitingTimeOverride:
@@ -320,7 +320,7 @@ class TestMaxWaitingTimeOverride:
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get(
             "https://api.github.com/rate_limit",
-            json={"resources": {"core": {"remaining": 0, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}},
+            json={"resources": {"core": {"remaining": 0, "reset": 4070908800}}},
         )
         monkeypatch.setattr("components.time.sleep", lambda seconds: None)
         authenticator = GithubAppMultiPemAuthenticator(
@@ -349,7 +349,7 @@ class TestGitHubEnterpriseServerApiUrl:
             "https://github.company.org/api/v3/app/installations/222/access_tokens", json={"token": "ghs_a"}
         )
         ghes_quota_mock = requests_mock.get(
-            "https://github.company.org/api/v3/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}
+            "https://github.company.org/api/v3/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}
         )
         authenticator = GithubAppMultiPemAuthenticator(
             config={"api_url": "https://github.company.org/api/v3/"},
@@ -362,104 +362,9 @@ class TestGitHubEnterpriseServerApiUrl:
 
     def test_defaults_to_public_github_when_api_url_is_absent(self, requests_mock):
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
         assert authenticator.token == "token ghs_a"
-
-
-class TestResponseAwareReconciliation:
-    def _prepared_request(self, token, url="https://api.github.com/repos/org/repo"):
-        request = requests.Request("GET", url).prepare()
-        request.headers["Authorization"] = f"token {token}"
-        return request
-
-    def _response(self, status_code=200, remaining=None, reset=None):
-        response = requests.Response()
-        response.status_code = status_code
-        if remaining is not None:
-            response.headers["X-RateLimit-Remaining"] = str(remaining)
-        if reset is not None:
-            response.headers["X-RateLimit-Reset"] = str(reset)
-        return response
-
-    def test_update_from_response_tightens_the_local_estimate(self, requests_mock):
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator._ensure_ready()
-        cache = authenticator._caches[0]
-
-        authenticator.update_from_response(self._prepared_request("ghs_a"), self._response(remaining=42, reset=4070908800))
-
-        assert cache.remaining[_REST_POOL] == 42
-
-    def test_update_from_response_ignores_an_unrelated_token(self, requests_mock):
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator._ensure_ready()
-        cache = authenticator._caches[0]
-
-        authenticator.update_from_response(self._prepared_request("some-other-token"), self._response(remaining=0, reset=4070908800))
-
-        assert cache.remaining[_REST_POOL] == 5000
-
-    def test_update_from_response_adopts_a_fresh_window(self, requests_mock):
-        """A later reset is a new window; the response's count describes it, not a stale local one."""
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 1, "reset": 1000}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator._ensure_ready()
-        cache = authenticator._caches[0]
-
-        authenticator.update_from_response(self._prepared_request("ghs_a"), self._response(remaining=5000, reset=2000))
-
-        assert (cache.remaining[_REST_POOL], cache.reset_at[_REST_POOL]) == (5000, 2000)
-
-    def test_update_from_response_tracks_rest_and_graphql_independently(self, requests_mock):
-        """The bug this guards against: blending GraphQL response headers into the REST counter
-        (or vice versa) would let one budget's exhaustion starve the other."""
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get(
-            "https://api.github.com/rate_limit",
-            json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}},
-        )
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator._ensure_ready()
-        cache = authenticator._caches[0]
-
-        authenticator.update_from_response(
-            self._prepared_request("ghs_a", url="https://api.github.com/graphql"), self._response(remaining=1, reset=4070908800)
-        )
-
-        assert cache.remaining[_GRAPHQL_POOL] == 1
-        assert cache.remaining[_REST_POOL] == 5000
-
-    def test_has_alternative_token_true_when_sender_exhausted_and_another_has_quota(self, requests_mock):
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
-        requests_mock.get(
-            "https://api.github.com/rate_limit",
-            [
-                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}}},
-            ],
-        )
-        authenticator = GithubAppMultiPemAuthenticator(
-            config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))
-        )
-        authenticator._ensure_ready()
-        authenticator._caches[0].remaining[_REST_POOL] = 0
-
-        assert authenticator.has_alternative_token(self._prepared_request("ghs_a")) is True
-
-    def test_has_alternative_token_false_when_only_one_installation(self, requests_mock):
-        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 0, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
-        authenticator = GithubAppMultiPemAuthenticator(config={}, parameters={}, github_apps=_github_apps_field(("111", "222", FAKE_PEM)))
-        authenticator._ensure_ready()
-
-        assert authenticator.has_alternative_token(self._prepared_request("ghs_a")) is False
 
 
 class TestManifestWiring:
@@ -475,7 +380,7 @@ class TestManifestWiring:
         being constructed with an empty token list.
         """
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
-        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}, "graphql": {"remaining": 5000, "reset": 4070908800}}})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
         authenticator = _selective_authenticator(self._config(_github_apps_field(("111", "222", FAKE_PEM))))
         assert isinstance(authenticator, GithubAppMultiPemAuthenticator)
 
