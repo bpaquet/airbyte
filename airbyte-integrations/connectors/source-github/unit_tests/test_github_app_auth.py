@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Airbyte, Inc., all rights reserved.
 #
 
+import logging
 import threading
 
 import jwt
@@ -527,3 +528,48 @@ class TestSingleChargePerRequest:
 
         assert request.headers["Authorization"] == "token ghs_a"
         assert authenticator._state.caches[0].remaining == 5000
+
+
+class TestQuotaLogging:
+    def _two_installations(self, requests_mock, first_remaining=5000):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        requests_mock.get(
+            "https://api.github.com/rate_limit",
+            [
+                {"json": {"resources": {"core": {"remaining": first_remaining, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
+            ],
+        )
+        return _authenticator(_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM)))
+
+    def test_seeding_logs_each_installation(self, requests_mock, caplog):
+        caplog.set_level(logging.INFO, logger="airbyte")
+        _sign(self._two_installations(requests_mock))
+
+        seeded = [r.getMessage() for r in caplog.records if "quota seeded" in r.getMessage()]
+        assert len(seeded) == 2
+        assert "app_id=111 installation_id=222 remaining=5000" in seeded[0]
+        assert "app_id=333 installation_id=444 remaining=5000" in seeded[1]
+
+    def test_periodic_summary_lists_every_installation(self, requests_mock, caplog, monkeypatch):
+        monkeypatch.setattr("components._QUOTA_LOG_EVERY_CALLS", 2)
+        caplog.set_level(logging.INFO, logger="airbyte")
+        authenticator = self._two_installations(requests_mock)
+
+        _sign(authenticator)
+        _sign(authenticator)
+
+        summaries = [r.getMessage() for r in caplog.records if "quota after" in r.getMessage()]
+        assert summaries == [
+            "github_app_auth: quota after 2 calls: app_id=111 installation_id=222 remaining=4998 reset_at=2099-01-01T00:00:00Z; "
+            "app_id=333 installation_id=444 remaining=5000 reset_at=2099-01-01T00:00:00Z"
+        ]
+
+    def test_rotation_is_logged(self, requests_mock, caplog):
+        caplog.set_level(logging.INFO, logger="airbyte")
+        authenticator = self._two_installations(requests_mock, first_remaining=50)
+
+        assert _sign(authenticator) == "token ghs_b"
+        assert any("app_id=111 installation_id=222 remaining=50" in r.getMessage() and "rotating" in r.getMessage() for r in caplog.records)
+
