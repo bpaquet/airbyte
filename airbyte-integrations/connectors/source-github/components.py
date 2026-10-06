@@ -684,6 +684,7 @@ _INSTALLATION_TOKEN_LIFETIME_SECONDS = 3600
 # Same values as RateLimitedMultipleTokenAuthenticator's reserve and MIN_EXHAUSTION_WAIT.
 _BUDGET_MIN_RESERVE = 50
 _MIN_EXHAUSTION_WAIT_SECONDS = 5.0
+_QUOTA_LOG_EVERY_CALLS = 500
 
 
 class _InstallationTokenCache:
@@ -701,6 +702,13 @@ class _InstallationTokenCache:
         self.remaining: Optional[int] = None
         self.reset_at: Optional[float] = None
         self._token_lock = threading.Lock()
+
+    def describe_quota(self) -> str:
+        label = f"app_id={self._app_id} installation_id={self._installation_id}"
+        if self.remaining is None:
+            return f"{label} remaining=untracked"
+        reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.reset_at))
+        return f"{label} remaining={self.remaining} reset_at={reset}"
 
     def _mint_app_jwt(self) -> str:
         now = int(time.time())
@@ -751,12 +759,13 @@ class _InstallationTokenCache:
             # GHES with rate limiting disabled; same as the token path's `unavailable_status_codes`.
             self.remaining = None
             self.reset_at = None
-            return
-        # 401/403 is a revoked token, never "quota tracking unavailable" (same rule as the token path).
-        _check_response(response, f"rate_limit seeding for app_id={self._app_id}", config_error_statuses=(401, 403))
-        core = response.json()["resources"]["core"]
-        self.remaining = core["remaining"]
-        self.reset_at = core["reset"]
+        else:
+            # 401/403 is a revoked token, never "quota tracking unavailable" (same rule as the token path).
+            _check_response(response, f"rate_limit seeding for app_id={self._app_id}", config_error_statuses=(401, 403))
+            core = response.json()["resources"]["core"]
+            self.remaining = core["remaining"]
+            self.reset_at = core["reset"]
+        LOGGER.info("github_app_auth: quota seeded from /rate_limit: %s", self.describe_quota())
 
 
 def _raise_config_error(message: str) -> None:
@@ -814,6 +823,7 @@ class _SharedGithubAppState:
     def __init__(self) -> None:
         self.caches: Optional[List[_InstallationTokenCache]] = None
         self.active_index = 0
+        self.charged_calls = 0
         self.lock = threading.Lock()
 
 
@@ -869,7 +879,15 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
             if cache.remaining is None or cache.remaining > _BUDGET_MIN_RESERVE:
                 if cache.remaining is not None:
                     cache.remaining -= 1
+                state.charged_calls += 1
+                if state.charged_calls % _QUOTA_LOG_EVERY_CALLS == 0:
+                    LOGGER.info(
+                        "github_app_auth: quota after %d calls: %s",
+                        state.charged_calls,
+                        "; ".join(c.describe_quota() for c in state.caches),
+                    )
                 return cache
+            LOGGER.info("github_app_auth: %s is at its reserve, rotating to the next installation", cache.describe_quota())
             state.active_index = (state.active_index + 1) % n
         return None
 
