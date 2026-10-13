@@ -132,8 +132,24 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: v2/incidents
           http_method: GET
+          request_parameters:
+            page[size]: "100"
           request_headers:
             DD-APPLICATION-KEY: "{{ config['application_key'] }}"
+          error_handler:
+            type: CompositeErrorHandler
+            error_handlers:
+              - type: DefaultErrorHandler
+                max_retries: 10
+                backoff_strategies:
+                  - type: WaitTimeFromHeader
+                    header: X-RateLimit-Reset
+                response_filters:
+                  - type: HttpResponseFilter
+                    action: RETRY
+                    http_codes:
+                      - 429
+                    error_message: Too many requests, retrying...
         record_selector:
           type: RecordSelector
           extractor:
