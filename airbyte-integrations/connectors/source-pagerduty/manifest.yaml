@@ -37,8 +37,6 @@ definitions:
           http_method: GET
           request_parameters:
             limit: "{{ config.get('page_size', 100) }}"
-            since: "{{ day_delta(-config.get('cutoff_days', 90), format='%Y-%m-%dT%H:%M:%SZ') }}"
-            until: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
         record_selector:
           type: RecordSelector
           extractor:
@@ -50,6 +48,29 @@ definitions:
             condition: "{{ record.get('service', {}).get('summary') not in config.get('exclude_services', []) }}"
         paginator:
           $ref: "#/definitions/paginator"
+      # PagerDuty rejects since/until ranges longer than 6 months
+      incremental_sync:
+        type: DatetimeBasedCursor
+        cursor_field: created_at
+        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+        start_datetime:
+          type: MinMaxDatetime
+          datetime: "{{ day_delta(-config.get('cutoff_days', 90), format='%Y-%m-%dT%H:%M:%SZ') }}"
+          datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+        end_datetime:
+          type: MinMaxDatetime
+          datetime: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+          datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+        step: P90D
+        cursor_granularity: PT1S
+        start_time_option:
+          type: RequestOption
+          field_name: since
+          inject_into: request_parameter
+        end_time_option:
+          type: RequestOption
+          field_name: until
+          inject_into: request_parameter
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -230,7 +251,7 @@ spec:
     properties:
       cutoff_days:
         type: integer
-        description: Fetch incidents created in the last number of days (PagerDuty allows at most 180)
+        description: Fetch incidents created in the last number of days
         order: 0
         title: Cutoff Days
         default: 90
