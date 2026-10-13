@@ -13,6 +13,16 @@ check:
     - priorities
 
 definitions:
+  paginator:
+    type: DefaultPaginator
+    page_token_option:
+      type: RequestOption
+      field_name: offset
+      inject_into: request_parameter
+    pagination_strategy:
+      type: CursorPagination
+      cursor_value: "{{ response.get('offset', 0) + response.get('limit', 0) }}"
+      stop_condition: "{{ not response.get('more') }}"
   streams:
     incidents:
       type: DeclarativeStream
@@ -25,12 +35,21 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /incidents
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
+            since: "{{ day_delta(-config.get('cutoff_days', 90), format='%Y-%m-%dT%H:%M:%SZ') }}"
+            until: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - incidents
+          record_filter:
+            type: RecordFilter
+            condition: "{{ record.get('service', {}).get('summary') not in config.get('exclude_services', []) }}"
+        paginator:
+          $ref: "#/definitions/paginator"
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -46,12 +65,17 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /incidents/{{ stream_partition.incident_id }}/log_entries
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
+            is_overview: "{{ 'true' if config.get('incident_log_entries_overview', true) else 'false' }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - log_entries
+        paginator:
+          $ref: "#/definitions/paginator"
         partition_router:
           type: SubstreamPartitionRouter
           parent_stream_configs:
@@ -75,12 +99,16 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /teams
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - teams
+        paginator:
+          $ref: "#/definitions/paginator"
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -96,12 +124,16 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /services
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - services
+        paginator:
+          $ref: "#/definitions/paginator"
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -117,12 +149,16 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /users
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - users
+        paginator:
+          $ref: "#/definitions/paginator"
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -138,12 +174,16 @@ definitions:
           $ref: "#/definitions/base_requester"
           path: /priorities
           http_method: GET
+          request_parameters:
+            limit: "{{ config.get('page_size', 100) }}"
         record_selector:
           type: RecordSelector
           extractor:
             type: DpathExtractor
             field_path:
               - priorities
+        paginator:
+          $ref: "#/definitions/paginator"
       schema_loader:
         type: InlineSchemaLoader
         schema:
@@ -158,6 +198,19 @@ definitions:
         type: RequestOption
         field_name: Authorization
         inject_into: header
+    error_handler:
+      type: DefaultErrorHandler
+      max_retries: 8
+      backoff_strategies:
+        - type: WaitTimeFromHeader
+          header: ratelimit-reset
+        - type: ExponentialBackoffStrategy
+      response_filters:
+        - type: HttpResponseFilter
+          action: RETRY
+          http_codes:
+            - 429
+          error_message: Too many requests, retrying...
 
 streams:
   - $ref: "#/definitions/streams/incidents"
@@ -177,7 +230,7 @@ spec:
     properties:
       cutoff_days:
         type: integer
-        description: Fetch pipelines updated in the last number of days
+        description: Fetch incidents created in the last number of days (PagerDuty allows at most 180)
         order: 0
         title: Cutoff Days
         default: 90
@@ -230,8 +283,8 @@ spec:
         description: page size to use when querying PagerDuty API
         order: 5
         title: Page Size
-        default: 25
-        maximum: 25
+        default: 100
+        maximum: 100
         minimum: 1
       service_details:
         type: array
