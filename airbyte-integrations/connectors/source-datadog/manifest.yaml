@@ -168,8 +168,9 @@ definitions:
               {{ response.get("meta", {}).get("pagination",
               {}).get("next_offset", {}) }}
             stop_condition: >-
-              {{ not response.get("meta", {}).get("pagination",
-              {}).get("next_offset", {}) }}
+              {{ not response.get("data") or response.get("meta",
+              {}).get("pagination", {}).get("next_offset") ==
+              response.get("meta", {}).get("pagination", {}).get("offset") }}
       schema_loader:
         type: InlineSchemaLoader
         schema:
