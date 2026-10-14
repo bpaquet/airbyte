@@ -3,7 +3,7 @@
 # max_retries, and loads it into the local abctl cluster. Run from the repo root: cdk-patch/push.sh <tag>
 
 VERSION=$1
-PATCHED_BASE=local/source-declarative-manifest:7.32.0-ratelimit
+PATCHED_BASE=local/source-declarative-manifest:7.35.0-ratelimit
 
 docker buildx build --load -t $PATCHED_BASE cdk-patch
 

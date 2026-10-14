@@ -7,7 +7,8 @@ import sys
 from importlib.metadata import version
 from importlib.util import find_spec
 
-EXPECTED = "7.32.0"
+
+EXPECTED = "7.35.0"
 if version("airbyte-cdk") != EXPECTED:
     sys.exit(f"patch written for airbyte-cdk {EXPECTED}, found {version('airbyte-cdk')}")
 
@@ -24,36 +25,42 @@ def patch(name, replacements):
     open(path, "w").write(text)
 
 
-patch("rate_limiting.py", [
-    (
-        "def user_defined_backoff_handler(\n    max_tries: Optional[int], max_time: Optional[int] = None, **kwargs: Any\n)",
-        "def user_defined_backoff_handler(\n    max_tries: Optional[int],\n    max_time: Optional[int] = None,\n"
-        "    exception: type = UserDefinedBackoffException,\n    **kwargs: Any,\n)",
-    ),
-    ("        backoff.constant,\n        UserDefinedBackoffException,\n", "        backoff.constant,\n        exception,\n"),
-])
+patch(
+    "rate_limiting.py",
+    [
+        (
+            "def user_defined_backoff_handler(\n    max_tries: Optional[int], max_time: Optional[int] = None, **kwargs: Any\n)",
+            "def user_defined_backoff_handler(\n    max_tries: Optional[int],\n    max_time: Optional[int] = None,\n"
+            "    exception: type = UserDefinedBackoffException,\n    **kwargs: Any,\n)",
+        ),
+        ("        backoff.constant,\n        UserDefinedBackoffException,\n", "        backoff.constant,\n        exception,\n"),
+    ],
+)
 
-patch("http_client.py", [
-    ("    RateLimitBackoffException,\n", "    RateLimitBackoffException,\n    RateLimitedUserDefinedBackoffException,\n"),
-    (
-        "        user_backoff_handler = user_defined_backoff_handler(max_tries=max_tries, max_time=max_time)(\n"
-        "            self._send\n        )",
-        "        user_backoff_handler = user_defined_backoff_handler(max_tries=max_tries, max_time=max_time)(\n"
-        "            user_defined_backoff_handler(\n"
-        "                max_tries=None, max_time=None, exception=RateLimitedUserDefinedBackoffException\n"
-        "            )(self._send)\n        )",
-    ),
-    (
-        "            if user_defined_backoff_time:\n                raise UserDefinedBackoffException(",
-        "            if user_defined_backoff_time:\n"
-        "                exception_class = (\n"
-        "                    RateLimitedUserDefinedBackoffException\n"
-        "                    if retry_endlessly\n"
-        "                    else UserDefinedBackoffException\n"
-        "                )\n"
-        "                raise exception_class(",
-    ),
-])
+patch(
+    "http_client.py",
+    [
+        ("    RateLimitBackoffException,\n", "    RateLimitBackoffException,\n    RateLimitedUserDefinedBackoffException,\n"),
+        (
+            "        user_backoff_handler = user_defined_backoff_handler(max_tries=max_tries, max_time=max_time)(\n"
+            "            self._send\n        )",
+            "        user_backoff_handler = user_defined_backoff_handler(max_tries=max_tries, max_time=max_time)(\n"
+            "            user_defined_backoff_handler(\n"
+            "                max_tries=None, max_time=None, exception=RateLimitedUserDefinedBackoffException\n"
+            "            )(self._send)\n        )",
+        ),
+        (
+            "            if user_defined_backoff_time:\n                raise UserDefinedBackoffException(",
+            "            if user_defined_backoff_time:\n"
+            "                exception_class = (\n"
+            "                    RateLimitedUserDefinedBackoffException\n"
+            "                    if retry_endlessly\n"
+            "                    else UserDefinedBackoffException\n"
+            "                )\n"
+            "                raise exception_class(",
+        ),
+    ],
+)
 
 with open(os.path.join(http_dir, "exceptions.py"), "a") as f:
     f.write(
