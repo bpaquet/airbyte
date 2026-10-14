@@ -288,7 +288,7 @@ Your token should have at least the `repo` scope. Depending on which streams you
 
 | Version | Date | Pull Request | Subject |
 | :----------- | :----------- | :------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2.7.8 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Retry the GraphQL streams with a smaller page size when GitHub reports a query timeout as an `INTERNAL` error on HTTP 200, instead of waiting for the rate-limit reset and then failing the stream |
+| 2.7.8 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Retry the GraphQL streams with a smaller page size when GitHub reports a query timeout as an `INTERNAL` error on HTTP 200, instead of waiting for the rate-limit reset and then failing the stream. `releases` no longer requests the asset uploader, which made GitHub fail the whole query for any release whose asset uploader was deleted; `assets[].uploader_id` is now always null |
 | 2.7.7 | 2026-10-13 | [88598](https://github.com/airbytehq/airbyte/pull/88598) | Update dependencies |
 | 2.7.6 | 2026-10-12 | [87443](https://github.com/airbytehq/airbyte/pull/87443) | Stop reading the `releases` stream at the first already-synced release instead of the full release history on every sync. Records are unchanged |
 | 2.7.5 | 2026-10-06 | [87862](https://github.com/airbytehq/airbyte/pull/87862) | Update dependencies |
