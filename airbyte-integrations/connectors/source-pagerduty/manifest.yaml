@@ -48,7 +48,7 @@ definitions:
             condition: "{{ record.get('service', {}).get('summary') not in config.get('exclude_services', []) }}"
         paginator:
           $ref: "#/definitions/paginator"
-      # PagerDuty rejects since/until ranges longer than 6 months
+      # PagerDuty caps since/until at 6 months and offset+limit at 10000 per query
       incremental_sync:
         type: DatetimeBasedCursor
         cursor_field: created_at
@@ -61,7 +61,7 @@ definitions:
           type: MinMaxDatetime
           datetime: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
           datetime_format: "%Y-%m-%dT%H:%M:%SZ"
-        step: P90D
+        step: P1D
         cursor_granularity: PT1S
         start_time_option:
           type: RequestOption
