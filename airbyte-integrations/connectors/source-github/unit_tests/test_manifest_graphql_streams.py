@@ -168,7 +168,7 @@ def _release_node(node_id="RE_1", database_id=11, tag="v1.0.0", created_at="2022
         "assets": {
             # `RA_kwDOAbcDEf4AAAAB` decodes to a msgpack array whose last 4 bytes are the
             # asset's numeric database ID.
-            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip", "uploader": {"id": 7}}],
+            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip"}],
             "pageInfo": {"hasNextPage": False},
         },
         "reaction_groups": [
@@ -221,10 +221,11 @@ def test_releases_record_keeps_the_rest_compatible_shape(rate_limit_mock_respons
         "eyes": 0,
         "total_count": 4,
     }
-    # Assets are unwrapped, the uploader is flattened, and the numeric id is recovered from
-    # the node id because GraphQL's ReleaseAsset has no databaseId.
+    # Assets are unwrapped and the numeric id is recovered from the node id because GraphQL's
+    # ReleaseAsset has no databaseId. `uploader_id` stays null: the query no longer asks for
+    # `uploadedBy`, which fails the whole query when an asset's uploader account was deleted.
     assert len(record["assets"]) == 1
-    assert record["assets"][0]["uploader_id"] == 7
+    assert record["assets"][0]["uploader_id"] is None
     assert record["assets"][0]["id"] == 1
     # GraphQL returns none of these; they are synthesized to match the old REST payload.
     assert record["url"] == f"https://api.github.com/repos/{REPOSITORY}/releases/11"
@@ -452,6 +453,19 @@ def test_releases_warns_when_a_release_has_more_than_100_assets(rate_limit_mock_
     assert error is None
     assert len(records[0]["assets"]) == 100
     assert any(">100 assets" in message for message in caplog.messages)
+
+
+def test_releases_query_does_not_request_the_asset_uploader(rate_limit_mock_response, requests_mock):
+    """`ReleaseAsset.uploadedBy` is non-null `User!`; for an asset whose uploader was deleted
+    GitHub fails the entire query with INTERNAL at every page size, so one such release failed
+    the stream on every sync."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_repository_envelope("releases", [_release_node()]))
+
+    _read(_config(), "releases")
+
+    query = json.loads(_graphql_requests(requests_mock)[0].body)["query"]
+    assert "uploadedBy" not in query
 
 
 def test_releases_without_reaction_groups_reports_null_reactions(rate_limit_mock_response, requests_mock):

@@ -17888,10 +17888,7 @@ definitions:
                           updated_at: updatedAt
                           browser_download_url: downloadUrl
                           url
-                          uploader: uploadedBy {
-                            __typename
-                            ... on User { id: databaseId }
-                          }
+                          # Asset uploader omitted: it is non-null `User!`, and a deleted uploader fails the whole query as INTERNAL.
                         }
                         pageInfo { hasNextPage }
                       }
