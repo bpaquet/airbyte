@@ -17705,7 +17705,8 @@ definitions:
     predicate: "{{ response is mapping and ((response.get('errors') or []) | length) > 0 }}"
     action: RETRY
     failure_type: transient_error
-    error_message: "GitHub GraphQL returned errors in the response body. Retrying."
+    # GitHub's own errors, truncated: without them a failing sync can't say what GitHub objected to.
+    error_message: "GitHub GraphQL returned errors in the response body: {{ (response.get('errors') | string)[:500] }}. Retrying."
 
   graphql_error_handler:
     type: DefaultErrorHandler
