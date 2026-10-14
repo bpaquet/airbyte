@@ -17752,6 +17752,38 @@ definitions:
       - $ref: "#/definitions/forbidden_skip_filter"
       - $ref: "#/definitions/gone_fail_filter"
 
+  # An asset uploader GitHub cannot resolve is reported as one INTERNAL error, with no `path`,
+  # per nulled `asset_uploaders` node. Only when the counts match exactly is the page kept,
+  # with `uploader_id` null for those assets; any other INTERNAL is still a query timeout.
+  releases_unresolved_uploader_filter:
+    type: HttpResponseFilter
+    predicate: >-
+      {%- set errors = response.get('errors') if response is mapping else none -%}
+      {%- set releases = ((response.get('data') or {}).get('repository') or {}).get('releases') if response is mapping else none -%}
+      {%- set nodes = (releases.get('nodes') or []) if releases is mapping else [] -%}
+      {{ errors is sequence and errors is not string and errors | length > 0
+         and errors | selectattr('type', 'defined') | selectattr('type', 'equalto', 'INTERNAL') | list | length == errors | length
+         and nodes | select('none') | list | length == 0
+         and nodes | map(attribute='asset_uploaders') | map(attribute='nodes') | sum(start=[]) | select('none') | list | length == errors | length }}
+    action: SUCCESS
+
+  releases_error_handler:
+    $ref: "#/definitions/graphql_error_handler"
+    response_filters:
+      - $ref: "#/definitions/releases_unresolved_uploader_filter"
+      - $ref: "#/definitions/graphql_body_rate_limited_filter"
+      - $ref: "#/definitions/graphql_reduce_page_size_filter"
+      - $ref: "#/definitions/graphql_body_not_found_skip_filter"
+      - $ref: "#/definitions/graphql_body_error_filter"
+      - $ref: "#/definitions/success_filter"
+      - $ref: "#/definitions/retry_after_rate_limit_filter"
+      - $ref: "#/definitions/primary_rate_limit_filter"
+      - $ref: "#/definitions/secondary_rate_limit_filter"
+      - $ref: "#/definitions/exhausted_quota_filter"
+      - $ref: "#/definitions/not_found_skip_filter"
+      - $ref: "#/definitions/forbidden_skip_filter"
+      - $ref: "#/definitions/gone_fail_filter"
+
   graphql_requester:
     $ref: "#/definitions/requester_base"
     http_method: POST
@@ -17845,6 +17877,8 @@ definitions:
         $ref: "#/definitions/graphql_page_size_reduction"
       requester:
         $ref: "#/definitions/graphql_requester"
+        error_handler:
+          $ref: "#/definitions/releases_error_handler"
         request_body:
           type: RequestBodyJsonObject
           value:
@@ -17888,9 +17922,19 @@ definitions:
                           updated_at: updatedAt
                           browser_download_url: downloadUrl
                           url
-                          # Asset uploader omitted: it is non-null `User!`, and a deleted uploader fails the whole query as INTERNAL.
                         }
                         pageInfo { hasNextPage }
+                      }
+                      # Kept apart from `assets`: `uploadedBy` is non-null `User!`, so an uploader GitHub
+                      # cannot resolve (a GitHub App, a deleted account) nulls its node here, not the asset.
+                      asset_uploaders: releaseAssets(first: 100) {
+                        nodes {
+                          node_id: id
+                          uploader: uploadedBy {
+                            __typename
+                            ... on User { id: databaseId }
+                          }
+                        }
                       }
                       reaction_groups: reactionGroups {
                         content

@@ -171,6 +171,7 @@ def _release_node(node_id="RE_1", database_id=11, tag="v1.0.0", created_at="2022
             "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip"}],
             "pageInfo": {"hasNextPage": False},
         },
+        "asset_uploaders": {"nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "uploader": {"__typename": "User", "id": 7}}]},
         "reaction_groups": [
             {"content": "THUMBS_UP", "reactors": {"totalCount": 3}},
             {"content": "HEART", "reactors": {"totalCount": 1}},
@@ -221,11 +222,11 @@ def test_releases_record_keeps_the_rest_compatible_shape(rate_limit_mock_respons
         "eyes": 0,
         "total_count": 4,
     }
-    # Assets are unwrapped and the numeric id is recovered from the node id because GraphQL's
-    # ReleaseAsset has no databaseId. `uploader_id` stays null: the query no longer asks for
-    # `uploadedBy`, which fails the whole query when an asset's uploader account was deleted.
+    # Assets are unwrapped, the uploader is joined from `asset_uploaders`, and the numeric id is
+    # recovered from the node id because GraphQL's ReleaseAsset has no databaseId.
     assert len(record["assets"]) == 1
-    assert record["assets"][0]["uploader_id"] is None
+    assert record["assets"][0]["uploader_id"] == 7
+    assert "asset_uploaders" not in record
     assert record["assets"][0]["id"] == 1
     # GraphQL returns none of these; they are synthesized to match the old REST payload.
     assert record["url"] == f"https://api.github.com/repos/{REPOSITORY}/releases/11"
@@ -455,17 +456,41 @@ def test_releases_warns_when_a_release_has_more_than_100_assets(rate_limit_mock_
     assert any(">100 assets" in message for message in caplog.messages)
 
 
-def test_releases_query_does_not_request_the_asset_uploader(rate_limit_mock_response, requests_mock):
-    """`ReleaseAsset.uploadedBy` is non-null `User!`; for an asset whose uploader was deleted
-    GitHub fails the entire query with INTERNAL at every page size, so one such release failed
-    the stream on every sync."""
+def _unresolved_uploader_page(errors):
+    node = _release_node()
+    node["asset_uploaders"] = {"nodes": [None]}
+    internal = {"type": "INTERNAL", "message": "Something went wrong while executing your query."}
+    return {**_repository_envelope("releases", [node]), "errors": [internal] * errors}
+
+
+def test_releases_keeps_a_page_whose_only_errors_are_unresolvable_asset_uploaders(rate_limit_mock_response, requests_mock):
+    """`ReleaseAsset.uploadedBy` is non-null `User!`. For an asset uploaded by a GitHub App or by
+    a deleted account GitHub nulls that `asset_uploaders` node and adds one INTERNAL error, at
+    every page size, so retrying or reducing the page would fail the stream on every sync."""
     _mock_repository_resolution(requests_mock)
-    requests_mock.post(GRAPHQL_URL, json=_repository_envelope("releases", [_release_node()]))
+    requests_mock.post(GRAPHQL_URL, json=_unresolved_uploader_page(errors=1))
 
-    _read(_config(), "releases")
+    records, error = _read(_config(), "releases")
 
-    query = json.loads(_graphql_requests(requests_mock)[0].body)["query"]
-    assert "uploadedBy" not in query
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 1
+    assert records[0]["assets"][0]["uploader_id"] is None
+    assert records[0]["assets"][0]["name"] == "asset.zip"
+
+
+def test_releases_still_reduces_the_page_size_when_internal_errors_outnumber_unresolved_uploaders(rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(
+        GRAPHQL_URL,
+        [{"json": _unresolved_uploader_page(errors=2)}, {"json": _repository_envelope("releases", [_release_node()])}],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    first_sizes = [json.loads(request.body)["variables"]["first"] for request in _graphql_requests(requests_mock)]
+    assert first_sizes == [10, 5]
+    assert records[0]["assets"][0]["uploader_id"] == 7
 
 
 def test_releases_without_reaction_groups_reports_null_reactions(rate_limit_mock_response, requests_mock):
