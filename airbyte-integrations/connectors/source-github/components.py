@@ -876,6 +876,10 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
         n = len(state.caches)
         for _ in range(n):
             cache = state.caches[state.active_index]
+            if cache.remaining is not None and cache.remaining <= _BUDGET_MIN_RESERVE and cache.reset_at <= time.time():
+                # Its window has reset since it was last seen; otherwise it stays parked at the reserve
+                # until every installation is exhausted.
+                cache.refresh_quota()
             if cache.remaining is None or cache.remaining > _BUDGET_MIN_RESERVE:
                 if cache.remaining is not None:
                     cache.remaining -= 1
