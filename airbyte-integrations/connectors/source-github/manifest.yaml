@@ -17637,9 +17637,16 @@ definitions:
   # the oversized `first` was already serialized into the body, so the retry never benefited;
   # only a later page saw the smaller size, and any non-502/504 response reset it. This action
   # re-enters the fetch with a smaller `first`, which is the behavior that was intended.
+  #
+  # GitHub also reports the same deadline as HTTP 200 with an `errors` entry of type INTERNAL
+  # ("Something went wrong while executing your query"). `http_codes` and `predicate` are OR'd.
   graphql_reduce_page_size_filter:
     type: HttpResponseFilter
     http_codes: [502, 504]
+    predicate: >-
+      {{ response is mapping
+         and ((response.get('errors') or []) | selectattr('type', 'defined')
+              | selectattr('type', 'equalto', 'INTERNAL') | list | length) > 0 }}
     action: REDUCE_PAGE_SIZE
     failure_type: transient_error
     error_message: >-
