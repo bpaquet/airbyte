@@ -63,6 +63,7 @@ definitions:
           datetime_format: "%Y-%m-%dT%H:%M:%SZ"
         step: P1D
         cursor_granularity: PT1S
+        lookback_window: "P{{ config.get('lookback_window_days', 7) }}D"
         start_time_option:
           type: RequestOption
           field_name: since
@@ -288,6 +289,15 @@ spec:
         order: 3
         title: Incident Log Entries Overview
         default: true
+      lookback_window_days:
+        type: integer
+        description: >-
+          Incremental syncs re-read incidents created in this many days before
+          the last synced one, to pick up their updates (status, priority...).
+        order: 8
+        title: Lookback Window (days)
+        default: 7
+        minimum: 0
       max_retries:
         type: integer
         description: >-
