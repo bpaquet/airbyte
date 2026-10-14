@@ -488,7 +488,10 @@ def test_persistent_graphql_body_errors_fail_the_stream(rate_limit_mock_response
     assert error is not None
     assert _records(messages) == []
     assert len(_graphql_requests(requests_mock)) > 1, "a body error must be retried, not consumed once and dropped"
-    assert any("GitHub GraphQL returned errors in the response body" in message for message in _trace_error_messages(messages))
+    assert any(
+        "GitHub GraphQL returned errors in the response body" in message and "Something went wrong while executing your query." in message
+        for message in _trace_error_messages(messages)
+    ), "the failure must carry GitHub's own error message"
 
 
 def test_page_size_for_large_streams_config_is_inert(rate_limit_mock_response, requests_mock):

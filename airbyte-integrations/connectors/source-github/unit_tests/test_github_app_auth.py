@@ -225,11 +225,13 @@ class TestStickyRotation:
 
     def test_all_exhausted_wait_is_floored_against_a_stale_reset(self, requests_mock, monkeypatch):
         """A reset timestamp at or behind "now" (clock skew, or read right at the boundary)
-        must not collapse the wait to ~0 and busy-loop re-querying /rate_limit."""
+        must not collapse the wait to ~0 and busy-loop re-querying /rate_limit, even when
+        re-reading the quota still reports it spent."""
         requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
         requests_mock.get(
             "https://api.github.com/rate_limit",
             [
+                {"json": {"resources": {"core": {"remaining": 0, "reset": 999}}}},
                 {"json": {"resources": {"core": {"remaining": 0, "reset": 999}}}},
                 {"json": {"resources": {"core": {"remaining": 5000, "reset": 4070908800}}}},
             ],
@@ -573,3 +575,44 @@ class TestQuotaLogging:
         assert _sign(authenticator) == "token ghs_b"
         assert any("app_id=111 installation_id=222 remaining=50" in r.getMessage() and "rotating" in r.getMessage() for r in caplog.records)
 
+
+
+class TestReserveRefresh:
+    def test_installation_at_reserve_is_reseeded_once_its_window_resets(self, requests_mock, monkeypatch):
+        clock = [999.0]
+        monkeypatch.setattr("components.time.time", lambda: clock[0])
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        rate_limit = requests_mock.get(
+            "https://api.github.com/rate_limit",
+            [
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 1000}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
+                {"json": {"resources": {"core": {"remaining": 5000, "reset": 4600}}}},
+            ],
+        )
+        authenticator = _authenticator(_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM)))
+
+        assert _sign(authenticator) == "token ghs_a"  # 51 -> 50: at the reserve now
+        clock[0] = 1001.0  # its window has reset
+
+        assert _sign(authenticator) == "token ghs_a"
+        assert rate_limit.call_count == 3
+        assert authenticator._state.caches[0].remaining == 4999
+
+    def test_installation_at_reserve_is_skipped_before_its_window_resets(self, requests_mock, monkeypatch):
+        monkeypatch.setattr("components.time.time", lambda: 999.0)
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        rate_limit = requests_mock.get(
+            "https://api.github.com/rate_limit",
+            [
+                {"json": {"resources": {"core": {"remaining": 51, "reset": 1000}}}},
+                {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
+            ],
+        )
+        authenticator = _authenticator(_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM)))
+
+        assert _sign(authenticator) == "token ghs_a"
+        assert _sign(authenticator) == "token ghs_b"
+        assert rate_limit.call_count == 2
