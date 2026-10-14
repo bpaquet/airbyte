@@ -521,6 +521,51 @@ def test_both_gateway_statuses_trigger_reduction(status_code, timeout_body, rate
     assert _variables(_graphql_requests(requests_mock)[1])["first"] == 5
 
 
+_INTERNAL_TIMEOUT_BODY = {
+    "data": None,
+    "errors": [
+        {
+            "type": "INTERNAL",
+            "message": "Something went wrong while executing your query on 2026-10-14T09:50:22Z. "
+            "Please include `7E88:3DA28F:D42559:1361494:6ACF505D` when reporting this issue.",
+        }
+    ],
+}
+
+
+def test_internal_error_on_200_refetches_the_same_page_with_a_halved_page_size(rate_limit_mock_response, requests_mock):
+    """GitHub reports the same query deadline as a 502/504 or as a 200 carrying an INTERNAL
+    error. Retrying the 200 at the same size failed the same way, behind a backoff that waits
+    for the rate-limit reset."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": _INTERNAL_TIMEOUT_BODY}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    requests = _graphql_requests(requests_mock)
+    assert [_variables(request)["first"] for request in requests] == [10, 5]
+    assert "after" not in _variables(requests[1])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, id="other_error_type"),
+        pytest.param({"errors": [{"message": "Something went wrong while executing your query."}]}, id="untyped_error"),
+        pytest.param({"message": "Something went wrong"}, id="message_shape"),
+    ],
+)
+def test_other_body_errors_on_200_do_not_reduce_the_page_size(body, rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    _read(_config(), "releases")
+
+    assert {_variables(request)["first"] for request in _graphql_requests(requests_mock)} == {10}
+
+
 def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, requests_mock):
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
