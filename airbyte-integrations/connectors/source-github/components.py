@@ -121,8 +121,8 @@ class ReleasesRecordTransformation(RecordTransformation):
     Ported verbatim from the legacy `streams.Releases.parse_response`. Five separate
     concerns, none of them expressible as AddFields/RemoveFields:
 
-    - `assets`: unwrap the connection, flatten `uploader` to `uploader_id`, and recover each
-      asset's numeric `id` from its node ID.
+    - `assets`: unwrap the connection, join `uploader_id` from `asset_uploaders`, and recover
+      each asset's numeric `id` from its node ID.
     - `reactions`: collapse `reactionGroups` into the REST reaction-count object, including
       the zero entries for reactions nobody used and the `total_count` sum.
     - `mentions_count`: unwrap a `totalCount`-only connection.
@@ -177,9 +177,12 @@ class ReleasesRecordTransformation(RecordTransformation):
                 record.get("id"),
                 record.get("repository"),
             )
+        uploaders = {
+            node["node_id"]: node.get("uploader") for node in ((record.pop("asset_uploaders", None) or {}).get("nodes") or []) if node
+        }
         assets = assets_data.get("nodes", [])
         for asset in assets:
-            uploader = asset.pop("uploader", None)
+            uploader = uploaders.get(asset.get("node_id"))
             asset["uploader_id"] = uploader.get("id") if uploader else None
             asset["id"] = _extract_database_id_from_node_id(asset.get("node_id"))
         return assets
