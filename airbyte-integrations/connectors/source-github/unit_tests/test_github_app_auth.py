@@ -8,6 +8,7 @@ import threading
 import jwt
 import pytest
 import requests
+from components import GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries, _shared_state_by_credentials
 from freezegun import freeze_time
 
 from airbyte_cdk.models import FailureType
@@ -18,7 +19,6 @@ from airbyte_cdk.sources.declarative.models.declarative_component_schema import 
     SelectiveAuthenticator as SelectiveAuthenticatorModel,
 )
 from airbyte_cdk.utils import AirbyteTracedException
-from components import GithubAppMultiPemAuthenticator, _InstallationTokenCache, _parse_entries, _shared_state_by_credentials
 
 from .utils import make_source
 
@@ -194,7 +194,9 @@ class TestStickyRotation:
                 {"json": {"resources": {"core": {"remaining": 500, "reset": 4070908800}}}},
             ],
         )
-        authenticator = _authenticator(_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM), ("555", "666", FAKE_PEM), ("777", "888", FAKE_PEM)))
+        authenticator = _authenticator(
+            _github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM), ("555", "666", FAKE_PEM), ("777", "888", FAKE_PEM))
+        )
         assert [_sign(authenticator) for _ in range(5)] == [
             "token ghs_a",
             "token ghs_b",
@@ -428,7 +430,9 @@ class TestManifestWiring:
     def test_config_normalization_handles_explicitly_null_credentials(self):
         """`credentials: null` is reachable via the API/Terraform/embedded use, same as the
         `api_url`/`max_waiting_time` cases this connector already guards against."""
-        source = make_source(catalog=None, config={"access_token": "pat-token", "credentials": None, "repositories": ["org/repo"]}, state=None)
+        source = make_source(
+            catalog=None, config={"access_token": "pat-token", "credentials": None, "repositories": ["org/repo"]}, state=None
+        )
         assert source._config["credentials"]["auth_mode"] == "token"
 
 
@@ -574,7 +578,6 @@ class TestQuotaLogging:
 
         assert _sign(authenticator) == "token ghs_b"
         assert any("app_id=111 installation_id=222 remaining=50" in r.getMessage() and "rotating" in r.getMessage() for r in caplog.records)
-
 
 
 class TestReserveRefresh:

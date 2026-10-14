@@ -805,9 +805,7 @@ def _parse_entries(github_apps: str) -> List[Tuple[str, str, str]]:
         installation_id = lines[i + 1]
         i += 2
         if i >= len(lines) or not lines[i].startswith("-----BEGIN"):
-            _raise_config_error(
-                f"credentials.github_apps: expected a '-----BEGIN...' PEM block after installation_id '{installation_id}'"
-            )
+            _raise_config_error(f"credentials.github_apps: expected a '-----BEGIN...' PEM block after installation_id '{installation_id}'")
         end = next((j for j in range(i, len(lines)) if lines[j].startswith("-----END")), None)
         if end is None:
             _raise_config_error(f"credentials.github_apps: PEM block for app_id '{app_id}' never reached a '-----END...' line")
