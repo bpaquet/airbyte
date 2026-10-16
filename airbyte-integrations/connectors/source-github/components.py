@@ -19,7 +19,7 @@ import time
 from dataclasses import InitVar, dataclass
 from itertools import groupby
 from os import getenv
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import jwt
@@ -34,11 +34,14 @@ from airbyte_cdk.sources.declarative.partition_routers.substream_partition_route
 from airbyte_cdk.sources.declarative.requesters.paginators.strategies.pagination_strategy import (
     PaginationStrategy,
 )
+from airbyte_cdk.sources.declarative.requesters.requester import HttpMethod, Requester
 from airbyte_cdk.sources.declarative.transformations import RecordTransformation
 from airbyte_cdk.sources.declarative.transformations.config_transformations.config_transformation import (
     ConfigTransformation,
 )
 from airbyte_cdk.sources.declarative.validators.validation_strategy import ValidationStrategy
+from airbyte_cdk.sources.streams.http.error_handlers import BackoffStrategy
+from airbyte_cdk.sources.streams.http.page_size_reduction_exception import PageSizeReductionRequiredException
 from airbyte_cdk.sources.types import Config, StreamSlice, StreamState
 from airbyte_cdk.utils.datetime_helpers import ab_datetime_parse
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException
@@ -116,6 +119,115 @@ def _resolve_page_size(page_size: Any, config: Config) -> Optional[int]:
             failure_type=FailureType.config_error,
         )
     return resolved
+
+
+# GitHub sends `X-RateLimit-Reset` on every response, 5xx included, so without this the header
+# strategies wait out the whole rate-limit window on a server error while quota is left.
+_SERVER_ERROR_BACKOFF_BASE_SECONDS = 10
+_SERVER_ERROR_BACKOFF_MAX_SECONDS = 300
+
+
+@dataclass
+class ServerErrorBackoffStrategy(BackoffStrategy):
+    """Exponential backoff for a 5xx without `Retry-After`; `None` defers to the next strategy."""
+
+    config: Config
+    parameters: InitVar[Mapping[str, Any]]
+
+    def backoff_time(
+        self,
+        response_or_exception: Optional[Any],
+        attempt_count: int,
+    ) -> Optional[float]:
+        if not isinstance(response_or_exception, requests.Response):
+            return None
+        if response_or_exception.status_code < 500 or "Retry-After" in response_or_exception.headers:
+            return None
+        return min(_SERVER_ERROR_BACKOFF_BASE_SECONDS * 2 ** max(attempt_count - 1, 0), _SERVER_ERROR_BACKOFF_MAX_SECONDS)
+
+
+_OMIT_MERGE_STATE_STATUS_VARIABLE = "omitMergeStateStatus"
+_MERGE_STATE_STATUS_RETRY_SECONDS = 10
+
+
+@dataclass
+class MergeStateStatusFallbackRequester(Requester):
+    """Delegates to `requester`. A page already reduced to one pull request that GitHub still
+    rejects is re-sent once unchanged, in case the failure was passing, then with
+    `mergeStateStatus` skipped, so that pull request is synced with `merge_state_status` null."""
+
+    requester: Requester
+    config: Config
+    parameters: InitVar[Mapping[str, Any]]
+
+    def get_authenticator(self) -> DeclarativeAuthenticator:
+        return self.requester.get_authenticator()
+
+    def get_url(self, **kwargs: Any) -> str:
+        return self.requester.get_url(**kwargs)
+
+    def get_url_base(self, **kwargs: Any) -> str:
+        return self.requester.get_url_base(**kwargs)
+
+    def get_path(self, **kwargs: Any) -> str:
+        return self.requester.get_path(**kwargs)
+
+    def get_method(self) -> HttpMethod:
+        return self.requester.get_method()
+
+    def get_request_params(self, **kwargs: Any) -> MutableMapping[str, Any]:
+        return self.requester.get_request_params(**kwargs)
+
+    def get_request_headers(self, **kwargs: Any) -> Mapping[str, Any]:
+        return self.requester.get_request_headers(**kwargs)
+
+    def get_request_body_data(self, **kwargs: Any) -> Union[Mapping[str, Any], str]:
+        return self.requester.get_request_body_data(**kwargs)
+
+    def get_request_body_json(self, **kwargs: Any) -> Mapping[str, Any]:
+        return self.requester.get_request_body_json(**kwargs)
+
+    def send_request(
+        self,
+        stream_state: Optional[StreamState] = None,
+        stream_slice: Optional[StreamSlice] = None,
+        next_page_token: Optional[Mapping[str, Any]] = None,
+        path: Optional[str] = None,
+        request_headers: Optional[Mapping[str, Any]] = None,
+        request_params: Optional[Mapping[str, Any]] = None,
+        request_body_data: Optional[Union[Mapping[str, Any], str]] = None,
+        request_body_json: Optional[Mapping[str, Any]] = None,
+        log_formatter: Optional[Callable[[requests.Response], Any]] = None,
+    ) -> Optional[requests.Response]:
+        kwargs = dict(
+            stream_state=stream_state,
+            stream_slice=stream_slice,
+            next_page_token=next_page_token,
+            path=path,
+            request_headers=request_headers,
+            request_params=request_params,
+            request_body_data=request_body_data,
+            request_body_json=request_body_json,
+            log_formatter=log_formatter,
+        )
+        try:
+            return self.requester.send_request(**kwargs)
+        except PageSizeReductionRequiredException:
+            variables = (request_body_json or {}).get("variables") or {}
+            if variables.get("first") != 1:
+                raise
+        time.sleep(_MERGE_STATE_STATUS_RETRY_SECONDS)
+        try:
+            return self.requester.send_request(**kwargs)
+        except PageSizeReductionRequiredException:
+            pass
+        LOGGER.warning(
+            "GitHub keeps rejecting a single pull request of %s; retrying it without mergeStateStatus, "
+            "so its merge_state_status is synced as null.",
+            (stream_slice or {}).get("repository"),
+        )
+        fallback_body = {**request_body_json, "variables": {**variables, _OMIT_MERGE_STATE_STATUS_VARIABLE: True}}
+        return self.requester.send_request(**{**kwargs, "request_body_json": fallback_body})
 
 
 @dataclass
