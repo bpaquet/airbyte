@@ -689,8 +689,9 @@ _QUOTA_LOG_EVERY_CALLS = 500
 
 class _InstallationTokenCache:
     """One installation's access token, minted lazily and refreshed before expiry, plus a local
-    REST-quota estimate. The estimate is seeded from `/rate_limit` and never reconciled against
-    response headers: a shared installation can drift it, at worst costing a real 403."""
+    REST-quota estimate and its GraphQL quota. The REST estimate is seeded from `/rate_limit` and
+    never reconciled against response headers: a shared installation can drift it, at worst
+    costing a real 403. The GraphQL quota is taken from each GraphQL response's headers."""
 
     def __init__(self, app_id: str, installation_id: str, private_key: str, api_url: str) -> None:
         self._app_id = app_id
@@ -701,6 +702,8 @@ class _InstallationTokenCache:
         self._expires_at: float = 0.0
         self.remaining: Optional[int] = None
         self.reset_at: Optional[float] = None
+        self.graphql_remaining: Optional[int] = None
+        self.graphql_reset_at: Optional[float] = None
         self._token_lock = threading.Lock()
 
     def describe_quota(self) -> str:
@@ -708,7 +711,19 @@ class _InstallationTokenCache:
         if self.remaining is None:
             return f"{label} remaining=untracked"
         reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.reset_at))
-        return f"{label} remaining={self.remaining} reset_at={reset}"
+        description = f"{label} remaining={self.remaining} reset_at={reset}"
+        if self.graphql_remaining is not None:
+            graphql_reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.graphql_reset_at))
+            description += f" graphql_remaining={self.graphql_remaining} graphql_reset_at={graphql_reset}"
+        return description
+
+    def has_graphql_budget(self) -> bool:
+        if self.graphql_remaining is None or self.graphql_remaining > _BUDGET_MIN_RESERVE:
+            return True
+        return self.graphql_reset_at is not None and self.graphql_reset_at <= time.time()
+
+    def signed(self, request: requests.PreparedRequest) -> bool:
+        return self._token is not None and request.headers.get("Authorization") == f"token {self._token}"
 
     def _mint_app_jwt(self) -> str:
         now = int(time.time())
@@ -768,6 +783,10 @@ class _InstallationTokenCache:
         LOGGER.info("github_app_auth: quota seeded from /rate_limit: %s", self.describe_quota())
 
 
+def _is_graphql(request: requests.PreparedRequest) -> bool:
+    return bool(request.url) and urlparse(request.url).path.endswith("/graphql")
+
+
 def _raise_config_error(message: str) -> None:
     raise AirbyteTracedException(message=message, internal_message=message, failure_type=FailureType.config_error)
 
@@ -821,6 +840,7 @@ class _SharedGithubAppState:
     def __init__(self) -> None:
         self.caches: Optional[List[_InstallationTokenCache]] = None
         self.active_index = 0
+        self.graphql_active_index = 0
         self.charged_calls = 0
         self.lock = threading.Lock()
 
@@ -915,16 +935,49 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 for cache in state.caches:
                     cache.refresh_quota()
 
-    def _active_cache(self) -> _InstallationTokenCache:
+    def _graphql_cache(self) -> _InstallationTokenCache:
+        """Sticky like the REST selection, but on the GraphQL budget. With none left anywhere it
+        stays put, and the rate-limit response is waited out."""
         self._ensure_ready()
+        state = self._state
+        with state.lock:
+            n = len(state.caches)
+            for _ in range(n):
+                cache = state.caches[state.graphql_active_index]
+                if cache.has_graphql_budget():
+                    return cache
+                state.graphql_active_index = (state.graphql_active_index + 1) % n
+                LOGGER.info("github_app_auth: %s is out of GraphQL budget, rotating to the next installation", cache.describe_quota())
+            return state.caches[state.graphql_active_index]
+
+    def update_from_response(self, request: requests.PreparedRequest, response: requests.Response) -> None:
+        if response.headers.get("X-RateLimit-Resource") != "graphql" or self._state.caches is None:
+            return
+        remaining, reset = response.headers.get("X-RateLimit-Remaining"), response.headers.get("X-RateLimit-Reset")
+        if remaining is None or reset is None:
+            return
         with self._state.lock:
-            return self._state.caches[self._state.active_index]
+            for cache in self._state.caches:
+                if cache.signed(request):
+                    cache.graphql_remaining, cache.graphql_reset_at = int(remaining), float(reset)
+
+    def has_alternative_token(self, request: requests.PreparedRequest) -> bool:
+        if not _is_graphql(request) or self._state.caches is None:
+            return False
+        with self._state.lock:
+            senders = [cache for cache in self._state.caches if cache.signed(request)]
+            for cache in senders:
+                # The rate limit spends the sender even when the headers did not say so.
+                cache.graphql_remaining = 0
+                if cache.graphql_reset_at is None or cache.graphql_reset_at <= time.time():
+                    cache.graphql_reset_at = time.time() + _INSTALLATION_TOKEN_LIFETIME_SECONDS
+            return any(cache.has_graphql_budget() for cache in self._state.caches if cache not in senders)
 
     def __call__(self, request: requests.PreparedRequest) -> Any:
         # Charge here, once per real attempt: `HttpRequester` also reads the header preview. GraphQL
         # has its own point budget, so it must not draw down the REST estimate.
-        if request.url and urlparse(request.url).path.endswith("/graphql"):
-            cache = self._active_cache()
+        if _is_graphql(request):
+            cache = self._graphql_cache()
         else:
             cache = self._next_available_cache()
         request.headers["Authorization"] = f"token {cache.get_token()}"

@@ -291,7 +291,7 @@ Your token should have at least the `repo` scope. Depending on which streams you
 
 | Version | Date | Pull Request | Subject |
 | :----------- | :----------- | :------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2.8.0 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Add GitHub App authentication support, with multiple installations rotating for extra rate-limit headroom |
+| 2.8.0 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Add GitHub App authentication support, with multiple installations rotating for extra rate-limit headroom, on the REST and the GraphQL budgets separately |
 | 2.7.7 | 2026-10-13 | [88598](https://github.com/airbytehq/airbyte/pull/88598) | Update dependencies |
 | 2.7.6 | 2026-10-12 | [87443](https://github.com/airbytehq/airbyte/pull/87443) | Stop reading the `releases` stream at the first already-synced release instead of the full release history on every sync. Records are unchanged |
 | 2.7.5 | 2026-10-06 | [87862](https://github.com/airbytehq/airbyte/pull/87862) | Update dependencies |
