@@ -4,6 +4,7 @@
 
 import logging
 import threading
+import time
 
 import jwt
 import pytest
@@ -619,3 +620,120 @@ class TestReserveRefresh:
         assert _sign(authenticator) == "token ghs_a"
         assert _sign(authenticator) == "token ghs_b"
         assert rate_limit.call_count == 2
+
+
+def _graphql_request(token=None):
+    request = requests.Request("POST", "https://api.github.com/graphql").prepare()
+    if token:
+        request.headers["Authorization"] = f"token {token}"
+    return request
+
+
+def _graphql_response(remaining, reset=4070908800):
+    response = requests.Response()
+    response.status_code = 200
+    response.headers.update({"X-RateLimit-Resource": "graphql", "X-RateLimit-Remaining": str(remaining), "X-RateLimit-Reset": str(reset)})
+    return response
+
+
+class TestGraphqlRotation:
+    def _two_installations(self, requests_mock):
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        return _authenticator(_github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM)))
+
+    def _sign_graphql(self, authenticator):
+        request = _graphql_request()
+        authenticator(request)
+        return request
+
+    def test_graphql_rotates_once_the_active_installation_reaches_the_reserve(self, requests_mock):
+        authenticator = self._two_installations(requests_mock)
+
+        request = self._sign_graphql(authenticator)
+        authenticator.update_from_response(request, _graphql_response(remaining=51))
+        assert self._sign_graphql(authenticator).headers["Authorization"] == "token ghs_a"
+
+        authenticator.update_from_response(request, _graphql_response(remaining=50))
+        assert self._sign_graphql(authenticator).headers["Authorization"] == "token ghs_b"
+
+    def test_graphql_quota_returns_once_its_window_resets(self, requests_mock, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr("components.time.time", lambda: clock[0])
+        authenticator = self._two_installations(requests_mock)
+        for token in ("ghs_a", "ghs_b"):
+            request = self._sign_graphql(authenticator)
+            assert request.headers["Authorization"] == f"token {token}"
+            authenticator.update_from_response(request, _graphql_response(remaining=0, reset=2000))
+
+        assert not authenticator.has_alternative_token(_graphql_request("ghs_b"))
+        clock[0] = 2001.0
+        assert authenticator.has_alternative_token(_graphql_request("ghs_b"))
+
+    def test_graphql_rate_limit_has_an_alternative_while_another_installation_has_budget(self, requests_mock):
+        authenticator = self._two_installations(requests_mock)
+        request = self._sign_graphql(authenticator)
+        authenticator.update_from_response(request, _graphql_response(remaining=0))
+
+        assert authenticator.has_alternative_token(request)
+        assert self._sign_graphql(authenticator).headers["Authorization"] == "token ghs_b"
+
+    def test_graphql_rate_limit_without_headers_still_rotates(self, requests_mock):
+        authenticator = self._two_installations(requests_mock)
+        request = self._sign_graphql(authenticator)
+
+        assert authenticator.has_alternative_token(request)
+        assert self._sign_graphql(authenticator).headers["Authorization"] == "token ghs_b"
+
+    def test_rest_rate_limit_is_not_rotated_here(self, requests_mock):
+        authenticator = self._two_installations(requests_mock)
+        request = requests.Request("GET", "https://api.github.com/repos/org/repo").prepare()
+        authenticator(request)
+
+        assert not authenticator.has_alternative_token(request)
+
+    def test_rest_responses_do_not_touch_the_graphql_quota(self, requests_mock):
+        authenticator = self._two_installations(requests_mock)
+        request = self._sign_graphql(authenticator)
+        response = _graphql_response(remaining=0)
+        response.headers["X-RateLimit-Resource"] = "core"
+        authenticator.update_from_response(request, response)
+
+        assert authenticator._state.caches[0].graphql_remaining is None
+
+    def test_graphql_rate_limit_rotates_end_to_end_instead_of_waiting(self, requests_mock, monkeypatch):
+        """Seen in production: every GraphQL stream sat out ~40 minutes of each hour on one
+        installation's spent GraphQL budget while the others' were untouched."""
+        from .test_manifest_graphql_streams import GRAPHQL_URL, _mock_repository_resolution, _read, _release_node, _repository_envelope
+
+        sleeps = []
+        monkeypatch.setattr("time.sleep", sleeps.append)
+        requests_mock.post(_access_token_url("222"), json={"token": "ghs_a"})
+        requests_mock.post(_access_token_url("444"), json={"token": "ghs_b"})
+        requests_mock.get("https://api.github.com/rate_limit", json={"resources": {"core": {"remaining": 5000, "reset": 4070908800}}})
+        _mock_repository_resolution(requests_mock)
+        reset = str(int(time.time()) + 3600)
+        signed_with = []
+
+        def graphql(request, context):
+            signed_with.append(request.headers["Authorization"])
+            if len(signed_with) == 1:
+                context.headers.update({"X-RateLimit-Resource": "graphql", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset})
+                return {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}
+            return _repository_envelope("releases", [_release_node()])
+
+        requests_mock.post(GRAPHQL_URL, json=graphql)
+        config = {
+            "credentials": {"github_apps": _github_apps_field(("111", "222", FAKE_PEM), ("333", "444", FAKE_PEM))},
+            "repositories": ["airbytehq/airbyte"],
+            "start_date": "2000-01-01T00:00:00Z",
+        }
+
+        records, error = _read(config, "releases")
+
+        assert error is None
+        assert len(records) == 1
+        assert signed_with == ["token ghs_a", "token ghs_b"]
+        # The CDK adds 1s to the 0.1s rotation backoff.
+        assert max(sleeps, default=0) < 2

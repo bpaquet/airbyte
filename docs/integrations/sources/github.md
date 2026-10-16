@@ -291,7 +291,7 @@ Your token should have at least the `repo` scope. Depending on which streams you
 
 | Version | Date | Pull Request | Subject |
 | :----------- | :----------- | :------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2.8.0 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Add GitHub App authentication support, with multiple installations rotating for extra rate-limit headroom |
+| 2.8.0 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Add GitHub App authentication support, with multiple installations rotating for extra rate-limit headroom, on the REST and the GraphQL budgets separately |
 | 2.7.8 | 2026-10-14 | [TODO: fill in once this PR is opened](https://github.com/airbytehq/airbyte/pull/TODO) | Retry the GraphQL streams with a smaller page size when GitHub reports a query timeout as an `INTERNAL` error on HTTP 200, instead of waiting for the rate-limit reset and then failing the stream. `releases` no longer fails on assets whose uploader GitHub cannot resolve (a GitHub App or a deleted account); their `uploader_id` is null |
 | 2.7.7 | 2026-10-13 | [88598](https://github.com/airbytehq/airbyte/pull/88598) | Update dependencies |
 | 2.7.6 | 2026-10-12 | [87443](https://github.com/airbytehq/airbyte/pull/87443) | Stop reading the `releases` stream at the first already-synced release instead of the full release history on every sync. Records are unchanged |
