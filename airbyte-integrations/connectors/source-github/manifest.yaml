@@ -222,7 +222,12 @@ definitions:
   # Follow-up: give `HttpResponseFilter` access to the stream slice in the CDK, which fixes both
   # halves at once (same bucket as the token rotation follow-up noted below).
   rate_limit_backoff_strategies:
-    # Both strategies are capped by the user's Max Waiting Time, so that setting bounds every
+    # First, so a 5xx never reaches the header strategies below: GitHub sends
+    # `X-RateLimit-Reset` on server errors too, and waiting until it stalled a sync for an
+    # hour per 500 with quota left.
+    - type: CustomBackoffStrategy
+      class_name: source_declarative_manifest.components.ServerErrorBackoffStrategy
+    # Both header strategies are capped by the user's Max Waiting Time, so that setting bounds every
     # rate-limit wait rather than only the ones the authenticator decides before sending.
     # `check` runs with `config_overrides.max_waiting_time: 1`, which makes the cap 61s:
     # an interactive check then fails fast on an exhausted quota instead of sleeping
@@ -242,7 +247,7 @@ definitions:
     # multiplication as None, and a falsy test would read check's deliberate 0 as absent and hand
     # it 120 minutes. `+ 1` keeps the budget inclusive — the CDK compares with `>=`, so a user on
     # the spec's minimum of 1 minute would otherwise get a 60s cap equal to the `min_wait: 60`
-    # floor below, and every headerless 5xx would fail instead of retrying.
+    # floor below, and every connection timeout would fail instead of retrying.
     - type: WaitTimeFromHeader
       header: "Retry-After"
       max_waiting_time_in_seconds: "{{ (config['max_waiting_time'] if config.get('max_waiting_time') is not none else 120) * 60 + 1 }}"
@@ -263,7 +268,7 @@ definitions:
       #   403 + Retry-After: 30              30s      60s    <- floor missing
       #   403 + X-RateLimit-Reset now+10     60s      60s
       #   403 + reset already past           60s      60s
-      #   500 / timeout, no such headers     60s     expo    <- floor leaking
+      #   timeout, no such headers           60s     expo    <- floor leaking
       #
       # Two CDK strategies with mismatched options are why: WaitTimeFromHeader has no
       # `min_wait` at all, so Retry-After is used raw; WaitUntilTimeFromHeader returns
@@ -289,8 +294,8 @@ definitions:
       # the floor survives exactly where it belongs. Four other connectors combine these
       # two strategies and would move the same way.
       #
-      # Until then: a headerless 5xx or a connection timeout waits 60s per attempt, up to
-      # max_retries (5), on every stream that inherits these handlers.
+      # Until then: a connection timeout waits 60s per attempt, up to max_retries (5), on
+      # every stream that inherits these handlers. A 5xx is `ServerErrorBackoffStrategy`'s.
       # The wait below is only paid when rotating cannot help. CDK 7.26.0 reconciles the
       # authenticator's counters against every response (the `*_header` fields on the
       # quota pools above), so a primary rate limit — which GitHub reports as
@@ -17790,16 +17795,16 @@ definitions:
   # its retries. Raising the budget to 6 would let them; that is a deliberate change to how
   # long a stuck partition holds a sync open, so it is not made here, but no comment or message
   # below may assume the floor was reached.
-  # `reset_policy: NEVER` keeps the reduced size for the rest of the partition:
-  # restoring it after each good page re-triggers the timeout on the next page, which is the
-  # ineffective behavior the legacy handler had. The size is local to one `_read_pages` call,
-  # so one repository reducing does not change the page size any other repository is using.
+  # `AFTER_SUCCESSFUL_PAGE`: GitHub's 502/504/INTERNAL hit scattered pages, so keeping the
+  # reduced size left a long partition (doctolib/doctolib's 264k PRs) at 1 record per request,
+  # spending the GraphQL budget for the rest of its history. The size is local to one
+  # `_read_pages` call, so one repository reducing does not change any other's page size.
   graphql_page_size_reduction:
     type: PageSizeReduction
     reduction_factor: 2
     minimum_page_size: 1
     max_attempts: 5
-    reset_policy: NEVER
+    reset_policy: AFTER_SUCCESSFUL_PAGE
     # A `REDUCE_PAGE_SIZE` response never reaches the error handler's retry budget or its
     # backoff strategies, so these two settings are the whole retry contract for a 502/504 on
     # the GraphQL endpoint, and they exist to keep it comparable to the one every other stream
@@ -18496,56 +18501,63 @@ definitions:
       page_size_reduction:
         $ref: "#/definitions/graphql_page_size_reduction"
       requester:
-        $ref: "#/definitions/graphql_requester"
-        request_headers:
-          # https://docs.github.com/en/graphql/overview/schema-previews#merge-info-preview
-          User-Agent: "PostmanRuntime/7.28.0"
-          Accept: "application/vnd.github.merge-info-preview+json"
-        request_body:
-          type: RequestBodyJsonObject
-          value:
-            query: |
-              query PullRequestStats($owner: String!, $name: String!, $first: Int!, $after: String) {
-                repository(owner: $owner, name: $name) {
-                  pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                    nodes {
-                      node_id: id
-                      id: databaseId
-                      number
-                      updated_at: updatedAt
-                      changed_files: changedFiles
-                      deletions
-                      additions
-                      merged
-                      mergeable
-                      can_be_rebased: canBeRebased
-                      maintainer_can_modify: maintainerCanModify
-                      merge_state_status: mergeStateStatus
-                      comments { totalCount }
-                      commits { totalCount }
-                      review_comments: reviews(first: 100) {
-                        totalCount
-                        nodes { comments { totalCount } }
-                      }
-                      merged_by: mergedBy {
-                        type: __typename
-                        ... on User {
-                          node_id: id
-                          id: databaseId
-                          login
-                          avatar_url: avatarUrl
-                          html_url: url
-                          site_admin: isSiteAdmin
+        # `mergeStateStatus` is computed per request, and on some huge PRs GitHub cannot finish it
+        # before its gateway gives up, at every page size; this re-sends such a single-PR page
+        # with the field skipped instead of failing the repository on every sync. The CDK cannot see
+        # the REDUCE_PAGE_SIZE filter inside a CustomRequester and warns at startup; it still applies.
+        type: CustomRequester
+        class_name: source_declarative_manifest.components.MergeStateStatusFallbackRequester
+        requester:
+          $ref: "#/definitions/graphql_requester"
+          request_headers:
+            # https://docs.github.com/en/graphql/overview/schema-previews#merge-info-preview
+            User-Agent: "PostmanRuntime/7.28.0"
+            Accept: "application/vnd.github.merge-info-preview+json"
+          request_body:
+            type: RequestBodyJsonObject
+            value:
+              query: |
+                query PullRequestStats($owner: String!, $name: String!, $first: Int!, $after: String, $omitMergeStateStatus: Boolean = false) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                      nodes {
+                        node_id: id
+                        id: databaseId
+                        number
+                        updated_at: updatedAt
+                        changed_files: changedFiles
+                        deletions
+                        additions
+                        merged
+                        mergeable
+                        can_be_rebased: canBeRebased
+                        maintainer_can_modify: maintainerCanModify
+                        merge_state_status: mergeStateStatus @skip(if: $omitMergeStateStatus)
+                        comments { totalCount }
+                        commits { totalCount }
+                        review_comments: reviews(first: 100) {
+                          totalCount
+                          nodes { comments { totalCount } }
+                        }
+                        merged_by: mergedBy {
+                          type: __typename
+                          ... on User {
+                            node_id: id
+                            id: databaseId
+                            login
+                            avatar_url: avatarUrl
+                            html_url: url
+                            site_admin: isSiteAdmin
+                          }
                         }
                       }
+                      pageInfo { hasNextPage endCursor }
                     }
-                    pageInfo { hasNextPage endCursor }
                   }
                 }
-              }
-            variables:
-              owner: "{{ stream_partition.repository.split('/')[0] }}"
-              name: "{{ stream_partition.repository.split('/')[1] }}"
+              variables:
+                owner: "{{ stream_partition.repository.split('/')[0] }}"
+                name: "{{ stream_partition.repository.split('/')[1] }}"
       record_selector:
         type: RecordSelector
         extractor:

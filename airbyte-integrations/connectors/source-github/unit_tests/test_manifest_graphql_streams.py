@@ -623,9 +623,9 @@ def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, req
     assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 2]
 
 
-def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_response, requests_mock):
-    """`reset_policy: NEVER`. Restoring the configured size after a good page would re-trigger
-    the timeout on every subsequent page, which is what the legacy handler did."""
+def test_page_size_is_restored_after_a_successful_page(rate_limit_mock_response, requests_mock):
+    """`reset_policy: AFTER_SUCCESSFUL_PAGE`. GitHub rejects scattered pages, so keeping the
+    reduced size would read the rest of a long partition at the reduced size."""
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
         GRAPHQL_URL,
@@ -640,7 +640,7 @@ def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_respon
 
     assert error is None
     assert len(records) == 2
-    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 5]
+    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 10]
 
 
 def test_persistent_gateway_timeout_fails_the_stream_instead_of_looping(page_size_reduction_waits, rate_limit_mock_response, requests_mock):
@@ -855,6 +855,65 @@ def test_pull_request_stats_leaves_merged_by_null_when_not_merged(rate_limit_moc
     assert error is None
     assert records[0]["merged_by"] is None
     assert records[0]["review_comments"] == 0
+
+
+def _pull_request_stats_node(number=5, merge_state_status="CLEAN"):
+    return {
+        "node_id": f"PR_{number}",
+        "id": 20 + number,
+        "number": number,
+        "updated_at": "2022-06-08T00:00:00Z",
+        "merge_state_status": merge_state_status,
+        "comments": {"totalCount": 0},
+        "commits": {"totalCount": 1},
+        "review_comments": {"totalCount": 0, "nodes": []},
+        "merged_by": None,
+    }
+
+
+def _merge_state_status_times_out(request, context):
+    """GitHub's gateway answer when it cannot compute `mergeStateStatus` for a huge PR."""
+    if _variables(request).get("omitMergeStateStatus"):
+        node = _pull_request_stats_node()
+        node.pop("merge_state_status")
+        return _repository_envelope("pullRequests", [node])
+    context.status_code = 504
+    return {"message": "Gateway Timeout"}
+
+
+def test_pull_request_stats_skips_merge_state_status_for_a_pull_request_github_cannot_compute_it_for(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    """Seen on a 10,000-commit PR: `mergeStateStatus` times out at every page size, which failed
+    the repository on every sync."""
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_merge_state_status_times_out)
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert [record["number"] for record in records] == [5]
+    assert records[0].get("merge_state_status") is None
+    sent = [(_variables(request)["first"], _variables(request).get("omitMergeStateStatus")) for request in _graphql_requests(requests_mock)]
+    assert sent == [(10, None), (5, None), (2, None), (1, None), (1, None), (1, True)]
+
+
+def test_pull_request_stats_keeps_merge_state_status_when_the_single_pull_request_retry_succeeds(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    timeout = {"status_code": 504, "json": {"message": "Gateway Timeout"}}
+    requests_mock.post(
+        GRAPHQL_URL, [timeout, timeout, timeout, timeout, {"json": _repository_envelope("pullRequests", [_pull_request_stats_node()])}]
+    )
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert records[0]["merge_state_status"] == "CLEAN"
+    assert not any(_variables(request).get("omitMergeStateStatus") for request in _graphql_requests(requests_mock))
 
 
 # --- Shared behavior ------------------------------------------------------------------------
