@@ -686,6 +686,23 @@ class TestGraphqlRotation:
         assert authenticator.has_alternative_token(request)
         assert self._sign_graphql(authenticator).headers["Authorization"] == "token ghs_b"
 
+    def test_with_every_graphql_budget_spent_the_wait_is_the_earliest_reset(self, requests_mock, monkeypatch):
+        """Seen in production: the wait followed the sender's reset, 33 minutes after another
+        installation's budget had come back."""
+        monkeypatch.setattr("components.time.time", lambda: 1000.0)
+        authenticator = self._two_installations(requests_mock)
+        first = self._sign_graphql(authenticator)
+        authenticator.update_from_response(first, _graphql_response(remaining=0, reset=1500))
+        second = self._sign_graphql(authenticator)
+        assert second.headers["Authorization"] == "token ghs_b"
+        authenticator.update_from_response(second, _graphql_response(remaining=0, reset=3000))
+
+        assert authenticator.has_alternative_token(second)
+        retry = self._sign_graphql(authenticator)
+        assert retry.headers["Authorization"] == "token ghs_a"
+        authenticator.update_from_response(retry, _graphql_response(remaining=0, reset=1500))
+        assert not authenticator.has_alternative_token(retry)
+
     def test_rest_rate_limit_is_not_rotated_here(self, requests_mock):
         authenticator = self._two_installations(requests_mock)
         request = requests.Request("GET", "https://api.github.com/repos/org/repo").prepare()
