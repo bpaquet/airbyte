@@ -121,15 +121,26 @@ def _resolve_page_size(page_size: Any, config: Config) -> Optional[int]:
     return resolved
 
 
-# GitHub sends `X-RateLimit-Reset` on every response, 5xx included, so without this the header
-# strategies wait out the whole rate-limit window on a server error while quota is left.
-_SERVER_ERROR_BACKOFF_BASE_SECONDS = 10
-_SERVER_ERROR_BACKOFF_MAX_SECONDS = 300
+# GitHub sends `X-RateLimit-Reset` on every response, errors included, so without this the header
+# strategies wait out the whole rate-limit window on a transient error while quota is left.
+_TRANSIENT_ERROR_BACKOFF_BASE_SECONDS = 10
+_TRANSIENT_ERROR_BACKOFF_MAX_SECONDS = 300
+
+
+def _has_non_rate_limit_graphql_errors(response: requests.Response) -> bool:
+    try:
+        errors = response.json().get("errors")
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(errors, list) or not errors:
+        return False
+    return not any(isinstance(error, dict) and error.get("type") == "RATE_LIMITED" for error in errors)
 
 
 @dataclass
-class ServerErrorBackoffStrategy(BackoffStrategy):
-    """Exponential backoff for a 5xx without `Retry-After`; `None` defers to the next strategy."""
+class TransientErrorBackoffStrategy(BackoffStrategy):
+    """Exponential backoff for a 5xx without `Retry-After`, or a 200 carrying GraphQL errors other
+    than RATE_LIMITED; `None` defers to the next strategy."""
 
     config: Config
     parameters: InitVar[Mapping[str, Any]]
@@ -141,9 +152,12 @@ class ServerErrorBackoffStrategy(BackoffStrategy):
     ) -> Optional[float]:
         if not isinstance(response_or_exception, requests.Response):
             return None
-        if response_or_exception.status_code < 500 or "Retry-After" in response_or_exception.headers:
+        if "Retry-After" in response_or_exception.headers:
             return None
-        return min(_SERVER_ERROR_BACKOFF_BASE_SECONDS * 2 ** max(attempt_count - 1, 0), _SERVER_ERROR_BACKOFF_MAX_SECONDS)
+        status = response_or_exception.status_code
+        if status < 500 and not (status == 200 and _has_non_rate_limit_graphql_errors(response_or_exception)):
+            return None
+        return min(_TRANSIENT_ERROR_BACKOFF_BASE_SECONDS * 2 ** max(attempt_count - 1, 0), _TRANSIENT_ERROR_BACKOFF_MAX_SECONDS)
 
 
 _OMIT_MERGE_STATE_STATUS_VARIABLE = "omitMergeStateStatus"

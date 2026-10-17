@@ -232,11 +232,11 @@ definitions:
   # Follow-up: give `HttpResponseFilter` access to the stream slice in the CDK, which fixes both
   # halves at once (same bucket as the token rotation follow-up noted below).
   rate_limit_backoff_strategies:
-    # First, so a 5xx never reaches the header strategies below: GitHub sends
-    # `X-RateLimit-Reset` on server errors too, and waiting until it stalled a sync for an
-    # hour per 500 with quota left.
+    # First, so a 5xx or a GraphQL body error other than RATE_LIMITED never reaches the header
+    # strategies below: GitHub sends `X-RateLimit-Reset` on those too, and waiting until it
+    # stalled a sync for an hour per error with quota left.
     - type: CustomBackoffStrategy
-      class_name: source_declarative_manifest.components.ServerErrorBackoffStrategy
+      class_name: source_declarative_manifest.components.TransientErrorBackoffStrategy
     # Both header strategies are capped by the user's Max Waiting Time, so that setting bounds every
     # rate-limit wait rather than only the ones the authenticator decides before sending.
     # `check` runs with `config_overrides.max_waiting_time: 1`, which makes the cap 61s:
@@ -305,7 +305,7 @@ definitions:
       # two strategies and would move the same way.
       #
       # Until then: a connection timeout waits 60s per attempt, up to max_retries (5), on
-      # every stream that inherits these handlers. A 5xx is `ServerErrorBackoffStrategy`'s.
+      # every stream that inherits these handlers. A 5xx is `TransientErrorBackoffStrategy`'s.
       # The wait below is only paid when rotating cannot help. CDK 7.26.0 reconciles the
       # authenticator's counters against every response (the `*_header` fields on the
       # quota pools above), so a primary rate limit — which GitHub reports as
@@ -17654,14 +17654,15 @@ definitions:
   # re-enters the fetch with a smaller `first`, which is the behavior that was intended.
   #
   # GitHub also reports the same deadline as HTTP 200 with an `errors` entry of type INTERNAL
-  # ("Something went wrong while executing your query"). `http_codes` and `predicate` are OR'd.
+  # ("Something went wrong while executing your query"), and a page too costly to compute as
+  # RESOURCE_LIMITS_EXCEEDED. `http_codes` and `predicate` are OR'd.
   graphql_reduce_page_size_filter:
     type: HttpResponseFilter
     http_codes: [502, 504]
     predicate: >-
       {{ response is mapping
          and ((response.get('errors') or []) | selectattr('type', 'defined')
-              | selectattr('type', 'equalto', 'INTERNAL') | list | length) > 0 }}
+              | selectattr('type', 'in', ['INTERNAL', 'RESOURCE_LIMITS_EXCEEDED']) | list | length) > 0 }}
     action: REDUCE_PAGE_SIZE
     failure_type: transient_error
     error_message: >-

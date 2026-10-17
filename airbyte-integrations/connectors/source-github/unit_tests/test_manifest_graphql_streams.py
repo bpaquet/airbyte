@@ -12,6 +12,7 @@ the legacy `GitHubGraphQLErrorHandler` now actually reaches GitHub.
 
 import json
 import logging
+import time
 
 import pytest
 
@@ -572,12 +573,27 @@ _INTERNAL_TIMEOUT_BODY = {
 }
 
 
-def test_internal_error_on_200_refetches_the_same_page_with_a_halved_page_size(rate_limit_mock_response, requests_mock):
+_RESOURCE_LIMITS_BODY = {
+    "errors": [
+        {
+            "type": "RESOURCE_LIMITS_EXCEEDED",
+            "path": ["repository", "pullRequests", "nodes", 1, "comments"],
+            "message": "Resource limits for this query exceeded.",
+        }
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [pytest.param(_INTERNAL_TIMEOUT_BODY, id="internal"), pytest.param(_RESOURCE_LIMITS_BODY, id="resource_limits_exceeded")],
+)
+def test_internal_error_on_200_refetches_the_same_page_with_a_halved_page_size(body, rate_limit_mock_response, requests_mock):
     """GitHub reports the same query deadline as a 502/504 or as a 200 carrying an INTERNAL
-    error. Retrying the 200 at the same size failed the same way, behind a backoff that waits
-    for the rate-limit reset."""
+    error, and a page too costly to compute as RESOURCE_LIMITS_EXCEEDED. Retrying either at the
+    same size failed the same way, behind a backoff that waits for the rate-limit reset."""
     _mock_repository_resolution(requests_mock)
-    requests_mock.post(GRAPHQL_URL, [{"json": _INTERNAL_TIMEOUT_BODY}, {"json": _repository_envelope("releases", [_release_node()])}])
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
 
     records, error = _read(_config(), "releases")
 
@@ -603,6 +619,47 @@ def test_other_body_errors_on_200_do_not_reduce_the_page_size(body, rate_limit_m
     _read(_config(), "releases")
 
     assert {_variables(request)["first"] for request in _graphql_requests(requests_mock)} == {10}
+
+
+def test_other_body_errors_on_200_do_not_wait_for_the_rate_limit_reset(rate_limit_mock_response, requests_mock, monkeypatch):
+    """GitHub sends `X-RateLimit-Reset` on a 200 carrying errors too; waiting until it held one
+    page for close to an hour per retry while the GraphQL budget was fine."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
+def test_graphql_rate_limit_still_waits_for_the_reset(rate_limit_mock_response, requests_mock, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(time.time()) + 600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert max(sleeps) > 500
 
 
 def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, requests_mock):
