@@ -17681,7 +17681,8 @@ definitions:
       the `repo` scope or SAML SSO authorization for it. Skipping it.
 
   # GitHub's GraphQL API reports most failures as HTTP 200 with an `errors` array in the body:
-  # rate limiting (`errors[].type == "RATE_LIMITED"`), query timeouts ("Something went wrong
+  # rate limiting (`errors[].type` RATE_LIMITED, or RATE_LIMIT with code `graphql_rate_limit`
+  # when the installation is already over its budget), query timeouts ("Something went wrong
   # while executing your query") and node-limit breaches. `success_filter` matches on status
   # alone and `DefaultErrorHandler` stops at the first matching filter, so these two must come
   # before it. Without them a 200 carrying `errors` is consumed as an empty successful page:
@@ -17699,7 +17700,7 @@ definitions:
     predicate: >-
       {{ response is mapping
          and ((response.get('errors') or []) | selectattr('type', 'defined')
-              | selectattr('type', 'equalto', 'RATE_LIMITED') | list | length) > 0 }}
+              | selectattr('type', 'in', ['RATE_LIMITED', 'RATE_LIMIT']) | list | length) > 0 }}
     action: RATE_LIMITED
     error_message: "GitHub GraphQL rate limit hit. Waiting for the rate limit window to reset before retrying."
 

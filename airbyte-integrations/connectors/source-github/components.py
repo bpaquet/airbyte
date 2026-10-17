@@ -123,6 +123,8 @@ def _resolve_page_size(page_size: Any, config: Config) -> Optional[int]:
 # strategies wait out the whole rate-limit window on a transient error while quota is left.
 _TRANSIENT_ERROR_BACKOFF_BASE_SECONDS = 10
 _TRANSIENT_ERROR_BACKOFF_MAX_SECONDS = 300
+# RATE_LIMIT (code `graphql_rate_limit`) is what GitHub answers once the installation is already over.
+_GRAPHQL_RATE_LIMIT_TYPES = ("RATE_LIMITED", "RATE_LIMIT")
 
 
 def _has_non_rate_limit_graphql_errors(response: requests.Response) -> bool:
@@ -132,13 +134,13 @@ def _has_non_rate_limit_graphql_errors(response: requests.Response) -> bool:
         return False
     if not isinstance(errors, list) or not errors:
         return False
-    return not any(isinstance(error, dict) and error.get("type") == "RATE_LIMITED" for error in errors)
+    return not any(isinstance(error, dict) and error.get("type") in _GRAPHQL_RATE_LIMIT_TYPES for error in errors)
 
 
 @dataclass
 class TransientErrorBackoffStrategy(BackoffStrategy):
     """Exponential backoff for a 5xx without `Retry-After`, or a 200 carrying GraphQL errors other
-    than RATE_LIMITED; `None` defers to the next strategy."""
+    than a rate limit; `None` defers to the next strategy."""
 
     config: Config
     parameters: InitVar[Mapping[str, Any]]
