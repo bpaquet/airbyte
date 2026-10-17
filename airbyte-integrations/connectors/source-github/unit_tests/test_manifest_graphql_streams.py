@@ -643,7 +643,19 @@ def test_other_body_errors_on_200_do_not_wait_for_the_rate_limit_reset(rate_limi
     assert [seconds for seconds in sleeps if seconds >= 1] == [11]
 
 
-def test_graphql_rate_limit_still_waits_for_the_reset(rate_limit_mock_response, requests_mock, monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param({"type": "RATE_LIMITED", "message": "API rate limit exceeded"}, id="rate_limited"),
+        pytest.param(
+            {"type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded for installation ID 1."},
+            id="already_over_the_limit",
+        ),
+    ],
+)
+def test_graphql_rate_limit_still_waits_for_the_reset(error, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Both are rate limits. RATE_LIMIT was retried as a generic error, which ran out of
+    attempts in five minutes and failed the stream in production."""
     sleeps = []
     monkeypatch.setattr("time.sleep", sleeps.append)
     _mock_repository_resolution(requests_mock)
@@ -651,14 +663,14 @@ def test_graphql_rate_limit_still_waits_for_the_reset(rate_limit_mock_response, 
     requests_mock.post(
         GRAPHQL_URL,
         [
-            {"json": {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}, "headers": headers},
+            {"json": {"errors": [error]}, "headers": headers},
             {"json": _repository_envelope("releases", [_release_node()])},
         ],
     )
 
-    records, error = _read(_config(), "releases")
+    records, read_error = _read(_config(), "releases")
 
-    assert error is None
+    assert read_error is None
     assert max(sleeps) > 500
 
 
