@@ -1052,7 +1052,7 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
 
     def _graphql_cache(self) -> _InstallationTokenCache:
         """Sticky like the REST selection, but on the GraphQL budget. With none left anywhere it
-        stays put, and the rate-limit response is waited out."""
+        moves to the installation that resets first, so the rate-limit wait is that reset's."""
         self._ensure_ready()
         state = self._state
         with state.lock:
@@ -1063,7 +1063,9 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                     return cache
                 state.graphql_active_index = (state.graphql_active_index + 1) % n
                 LOGGER.info("github_app_auth: %s is out of GraphQL budget, rotating to the next installation", cache.describe_quota())
-            return state.caches[state.graphql_active_index]
+            earliest = min(range(n), key=lambda index: state.caches[index].graphql_reset_at or 0.0)
+            state.graphql_active_index = earliest
+            return state.caches[earliest]
 
     def update_from_response(self, request: requests.PreparedRequest, response: requests.Response) -> None:
         if response.headers.get("X-RateLimit-Resource") != "graphql" or self._state.caches is None:
@@ -1086,7 +1088,13 @@ class GithubAppMultiPemAuthenticator(DeclarativeAuthenticator):
                 cache.graphql_remaining = 0
                 if cache.graphql_reset_at is None or cache.graphql_reset_at <= time.time():
                     cache.graphql_reset_at = time.time() + _INSTALLATION_TOKEN_LIFETIME_SECONDS
-            return any(cache.has_graphql_budget() for cache in self._state.caches if cache not in senders)
+            others = [cache for cache in self._state.caches if cache not in senders]
+            if any(cache.has_graphql_budget() for cache in others):
+                return True
+            # Every budget is spent: one retry on the installation that resets first makes the
+            # wait computed from its response that earlier reset rather than the sender's.
+            sender_reset = min((cache.graphql_reset_at for cache in senders), default=None)
+            return sender_reset is not None and any(cache.graphql_reset_at < sender_reset for cache in others)
 
     def __call__(self, request: requests.PreparedRequest) -> Any:
         # Charge here, once per real attempt: `HttpRequester` also reads the header preview. GraphQL
