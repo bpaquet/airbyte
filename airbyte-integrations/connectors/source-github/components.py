@@ -129,11 +129,13 @@ _TRANSIENT_ERROR_BACKOFF_MAX_SECONDS = 300
 _GRAPHQL_RATE_LIMIT_TYPES = ("RATE_LIMITED", "RATE_LIMIT")
 
 
-def _has_non_rate_limit_graphql_errors(response: requests.Response) -> bool:
+def _is_transient_graphql_failure(response: requests.Response) -> bool:
+    """A body that does not parse (a response cut off in transit) or GraphQL errors other than a rate limit."""
     try:
-        errors = response.json().get("errors")
-    except (ValueError, AttributeError):
-        return False
+        body = response.json()
+    except ValueError:
+        return True
+    errors = body.get("errors") if isinstance(body, dict) else None
     if not isinstance(errors, list) or not errors:
         return False
     return not any(isinstance(error, dict) and error.get("type") in _GRAPHQL_RATE_LIMIT_TYPES for error in errors)
@@ -141,8 +143,8 @@ def _has_non_rate_limit_graphql_errors(response: requests.Response) -> bool:
 
 @dataclass
 class TransientErrorBackoffStrategy(BackoffStrategy):
-    """Exponential backoff for a 5xx without `Retry-After`, or a 200 carrying GraphQL errors other
-    than a rate limit; `None` defers to the next strategy."""
+    """Exponential backoff for a 5xx without `Retry-After`, or a retried 200 that is a transient GraphQL
+    failure; `None` defers to the next strategy."""
 
     config: Config
     parameters: InitVar[Mapping[str, Any]]
@@ -157,7 +159,7 @@ class TransientErrorBackoffStrategy(BackoffStrategy):
         if "Retry-After" in response_or_exception.headers:
             return None
         status = response_or_exception.status_code
-        if status < 500 and not (status == 200 and _has_non_rate_limit_graphql_errors(response_or_exception)):
+        if status < 500 and not (status == 200 and _is_transient_graphql_failure(response_or_exception)):
             return None
         return min(_TRANSIENT_ERROR_BACKOFF_BASE_SECONDS * 2 ** max(attempt_count - 1, 0), _TRANSIENT_ERROR_BACKOFF_MAX_SECONDS)
 

@@ -17722,6 +17722,15 @@ definitions:
     # GitHub's own errors, truncated: without them a failing sync can't say what GitHub objected to.
     error_message: "GitHub GraphQL returned errors in the response body: {{ (response.get('errors') | string)[:500] }}. Retrying."
 
+  # A 200 whose body does not parse, seen as a response cut off mid-string, reaches the filters
+  # as `{}`. Without this `success_filter` accepts it and the paginator fails reading it.
+  graphql_unparseable_body_filter:
+    type: HttpResponseFilter
+    predicate: "{{ not response }}"
+    action: RETRY
+    failure_type: transient_error
+    error_message: "GitHub GraphQL returned a response body that is not valid JSON. Retrying."
+
   graphql_error_handler:
     type: DefaultErrorHandler
     backoff_strategies:
@@ -17750,6 +17759,7 @@ definitions:
       - $ref: "#/definitions/graphql_reduce_page_size_filter"
       - $ref: "#/definitions/graphql_body_not_found_skip_filter"
       - $ref: "#/definitions/graphql_body_error_filter"
+      - $ref: "#/definitions/graphql_unparseable_body_filter"
       - $ref: "#/definitions/success_filter"
       - $ref: "#/definitions/retry_after_rate_limit_filter"
       - $ref: "#/definitions/primary_rate_limit_filter"
@@ -17782,6 +17792,7 @@ definitions:
       - $ref: "#/definitions/graphql_reduce_page_size_filter"
       - $ref: "#/definitions/graphql_body_not_found_skip_filter"
       - $ref: "#/definitions/graphql_body_error_filter"
+      - $ref: "#/definitions/graphql_unparseable_body_filter"
       - $ref: "#/definitions/success_filter"
       - $ref: "#/definitions/retry_after_rate_limit_filter"
       - $ref: "#/definitions/primary_rate_limit_filter"

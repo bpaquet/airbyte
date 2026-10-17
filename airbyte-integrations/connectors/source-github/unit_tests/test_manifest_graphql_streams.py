@@ -674,6 +674,29 @@ def test_graphql_rate_limit_still_waits_for_the_reset(error, rate_limit_mock_res
     assert max(sleeps) > 500
 
 
+@pytest.mark.parametrize("stream_name", ["releases", "reviews"])
+def test_a_response_cut_off_in_transit_is_retried_quickly(stream_name, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Seen in production on `reviews`: a 200 whose body stopped mid-string was accepted as a
+    success and the stream failed reading it."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"text": '{"data": {"repository": {"name": "airby', "headers": headers},
+            {"json": _repository_envelope("releases", [])},
+        ],
+    )
+
+    _, error = _read(_config(), stream_name)
+
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 2
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
 def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, requests_mock):
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
