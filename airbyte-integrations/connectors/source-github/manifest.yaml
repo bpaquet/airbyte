@@ -24,8 +24,9 @@ definitions:
        or record['full_name'] | regex_search('^((' ~ (config.get('repositories', []) | map('regex_search', '^(.*[*].*)$') | select | map('replace', '*', '.*') | join(')|(')) ~ '))') }}
 
   # `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` — the per-page size of the four REST streams
-  # the legacy code marked `large_stream = True`: `pull_requests`, `comments`, `issues` and
-  # `review_comments`. Every other REST stream sends `constants.DEFAULT_PAGE_SIZE` (100).
+  # the legacy code marked `large_stream = True`: `pull_requests`, `comments` and `issues`
+  # (`review_comments` was one too and now sends 100, see its requester). Every other REST
+  # stream sends `constants.DEFAULT_PAGE_SIZE` (100).
   #
   # The value is written out rather than read from `page_size_for_large_streams`, which was
   # removed from the spec in 1.0.1 and cannot be set from the UI since. What the legacy code
@@ -7408,7 +7409,9 @@ definitions:
     retriever:
       $ref: "#/definitions/repository_scoped_retriever"
       requester:
-        $ref: "#/definitions/large_stream_repository_scoped_requester"
+        # 100 per page, not the legacy large-stream 10: doctolib/doctolib's ~685k review comments
+        # were ~68k sequential requests, about 100 hours for a first read of one repository.
+        $ref: "#/definitions/repository_scoped_requester"
         # `pulls/comments`, not `review_comments`; legacy overrode `ReviewComments.path` for it.
         path: "repos/{{ stream_partition.repository }}/pulls/comments"
         # No `use_cache` here, unlike `comments` and `issues`. `ReviewComments.use_cache = True`
