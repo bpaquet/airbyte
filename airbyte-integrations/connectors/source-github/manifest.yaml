@@ -25,7 +25,7 @@ definitions:
 
   # `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` — the per-page size of the four REST streams
   # the legacy code marked `large_stream = True`: `pull_requests`, `comments` and `issues`
-  # (`review_comments` was one too and now sends 100, see its requester). Every other REST
+  # (`review_comments` was one too and now sends 30, see its requester). Every other REST
   # stream sends `constants.DEFAULT_PAGE_SIZE` (100).
   #
   # The value is written out rather than read from `page_size_for_large_streams`, which was
@@ -7419,9 +7419,12 @@ definitions:
     retriever:
       $ref: "#/definitions/repository_scoped_retriever"
       requester:
-        # 100 per page, not the legacy large-stream 10: doctolib/doctolib's ~685k review comments
-        # were ~68k sequential requests, about 100 hours for a first read of one repository.
+        # 30 per page, not the legacy large-stream 10: doctolib/doctolib's ~685k review comments
+        # were ~68k sequential requests. Not 100 either: GitHub pages by offset here, and past
+        # ~page 1,000 a page of 100 exceeds its 10s deadline (502) while 30 stays around 5s.
         $ref: "#/definitions/repository_scoped_requester"
+        request_parameters:
+          per_page: "30"
         # `pulls/comments`, not `review_comments`; legacy overrode `ReviewComments.path` for it.
         path: "repos/{{ stream_partition.repository }}/pulls/comments"
         # No `use_cache` here, unlike `comments` and `issues`. `ReviewComments.use_cache = True`
