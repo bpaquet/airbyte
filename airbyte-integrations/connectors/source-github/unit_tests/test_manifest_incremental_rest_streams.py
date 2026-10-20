@@ -47,7 +47,7 @@ MIGRATED_STREAMS = [
 ]
 
 # `review_comments` left the legacy large-stream page size; see its requester.
-_PER_PAGE = {"comments": "10", "issues": "10", "review_comments": "100"}
+_PER_PAGE = {"comments": "10", "issues": "10", "review_comments": "30"}
 
 _TOKEN_CONFIG = {"credentials": {"personal_access_token": "token"}}
 _START_DATE = "2022-02-02T10:10:01Z"
@@ -264,8 +264,8 @@ def test_page_size_is_the_large_stream_page_size(
     stream_name, endpoint, per_page, page_size_config, rate_limit_mock_response, requests_mock
 ):
     """All three were `large_stream = True`, so `comments` and `issues` send
-    `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` (10). `review_comments` sends 100: at 10 a
-    first read of a repository with ~685k review comments took about 100 hours.
+    `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` (10). `review_comments` sends 30: 10 took about
+    100 hours on a repository with ~685k review comments, and 100 hit GitHub's 502 on deep pages.
 
     The deprecated `page_size_for_large_streams` no longer changes it. The key left the spec in
     1.0.1, so a config still carrying it was set through the API or Terraform, and a null there
