@@ -24,8 +24,9 @@ definitions:
        or record['full_name'] | regex_search('^((' ~ (config.get('repositories', []) | map('regex_search', '^(.*[*].*)$') | select | map('replace', '*', '.*') | join(')|(')) ~ '))') }}
 
   # `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` — the per-page size of the four REST streams
-  # the legacy code marked `large_stream = True`: `pull_requests`, `comments`, `issues` and
-  # `review_comments`. Every other REST stream sends `constants.DEFAULT_PAGE_SIZE` (100).
+  # the legacy code marked `large_stream = True`: `pull_requests`, `comments` and `issues`
+  # (`review_comments` was one too and now sends 30, see its requester). Every other REST
+  # stream sends `constants.DEFAULT_PAGE_SIZE` (100).
   #
   # The value is written out rather than read from `page_size_for_large_streams`, which was
   # removed from the spec in 1.0.1 and cannot be set from the UI since. What the legacy code
@@ -232,7 +233,12 @@ definitions:
   # Follow-up: give `HttpResponseFilter` access to the stream slice in the CDK, which fixes both
   # halves at once (same bucket as the token rotation follow-up noted below).
   rate_limit_backoff_strategies:
-    # Both strategies are capped by the user's Max Waiting Time, so that setting bounds every
+    # First, so a 5xx or a GraphQL body error other than RATE_LIMITED never reaches the header
+    # strategies below: GitHub sends `X-RateLimit-Reset` on those too, and waiting until it
+    # stalled a sync for an hour per error with quota left.
+    - type: CustomBackoffStrategy
+      class_name: source_declarative_manifest.components.TransientErrorBackoffStrategy
+    # Both header strategies are capped by the user's Max Waiting Time, so that setting bounds every
     # rate-limit wait rather than only the ones the authenticator decides before sending.
     # `check` runs with `config_overrides.max_waiting_time: 1`, which makes the cap 61s:
     # an interactive check then fails fast on an exhausted quota instead of sleeping
@@ -252,7 +258,7 @@ definitions:
     # multiplication as None, and a falsy test would read check's deliberate 0 as absent and hand
     # it 120 minutes. `+ 1` keeps the budget inclusive — the CDK compares with `>=`, so a user on
     # the spec's minimum of 1 minute would otherwise get a 60s cap equal to the `min_wait: 60`
-    # floor below, and every headerless 5xx would fail instead of retrying.
+    # floor below, and every connection timeout would fail instead of retrying.
     - type: WaitTimeFromHeader
       header: "Retry-After"
       max_waiting_time_in_seconds: "{{ (config['max_waiting_time'] if config.get('max_waiting_time') is not none else 120) * 60 + 1 }}"
@@ -273,7 +279,7 @@ definitions:
       #   403 + Retry-After: 30              30s      60s    <- floor missing
       #   403 + X-RateLimit-Reset now+10     60s      60s
       #   403 + reset already past           60s      60s
-      #   500 / timeout, no such headers     60s     expo    <- floor leaking
+      #   timeout, no such headers           60s     expo    <- floor leaking
       #
       # Two CDK strategies with mismatched options are why: WaitTimeFromHeader has no
       # `min_wait` at all, so Retry-After is used raw; WaitUntilTimeFromHeader returns
@@ -299,8 +305,8 @@ definitions:
       # the floor survives exactly where it belongs. Four other connectors combine these
       # two strategies and would move the same way.
       #
-      # Until then: a headerless 5xx or a connection timeout waits 60s per attempt, up to
-      # max_retries (5), on every stream that inherits these handlers.
+      # Until then: a connection timeout waits 60s per attempt, up to max_retries (5), on
+      # every stream that inherits these handlers. A 5xx is `TransientErrorBackoffStrategy`'s.
       # The wait below is only paid when rotating cannot help. CDK 7.26.0 reconciles the
       # authenticator's counters against every response (the `*_header` fields on the
       # quota pools above), so a primary rate limit — which GitHub reports as
@@ -524,6 +530,13 @@ definitions:
   comments_error_handler:
     $ref: "#/definitions/skip_inaccessible_error_handler"
     max_retries: 7
+
+  # GitHub answers bursts of 500 on deep `pulls/comments` pages; a burst outlasting five
+  # retries failed doctolib/doctolib's first read, which restarts from scratch. The CDK still
+  # caps the retries of one request at 10 minutes.
+  review_comments_error_handler:
+    $ref: "#/definitions/skip_inaccessible_error_handler"
+    max_retries: 15
 
   # `repository_stats` resolves the explicit `org/repo` entries the user typed, and a 403 there
   # is one repository the token cannot see — a SAML-protected org is the common case. It must not
@@ -7413,16 +7426,46 @@ definitions:
     retriever:
       $ref: "#/definitions/repository_scoped_retriever"
       requester:
-        $ref: "#/definitions/large_stream_repository_scoped_requester"
+        $ref: "#/definitions/repository_scoped_requester"
+        # Without `sort=updated`, GitHub answers 500 on every deep page of a large repository
+        # (0/12 on doctolib/doctolib's ~685k comments, against 12/12 with it). The order is also
+        # what lets each window below stop at its end. 30 per page: 100 hits GitHub's 10s deadline.
+        request_parameters:
+          per_page: "30"
+          sort: "updated"
+          direction: "asc"
+        error_handler:
+          $ref: "#/definitions/review_comments_error_handler"
         # `pulls/comments`, not `review_comments`; legacy overrode `ReviewComments.path` for it.
         path: "repos/{{ stream_partition.repository }}/pulls/comments"
         # No `use_cache` here, unlike `comments` and `issues`. `ReviewComments.use_cache = True`
         # in Python was inert — no stream reads this one as a parent — and caching the pages of
         # a large stream costs sqlite writes for nothing.
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: []
+        # GitHub has no upper bound for `since`, so the last page of a window runs past its end;
+        # those records belong to the next window. Bounded on both sides so each record has one.
+        record_filter:
+          type: RecordFilter
+          condition: "{{ stream_interval['start_time'] <= record['updated_at'] <= stream_interval['end_time'] }}"
+      paginator:
+        type: DefaultPaginator
+        page_token_option:
+          type: RequestPath
+        pagination_strategy:
+          type: CustomPaginationStrategy
+          class_name: source_declarative_manifest.components.UpdatedWindowLinkPaginationStrategy
     transformations:
       $ref: "#/definitions/add_repository_and_rename_reactions_transformation"
+    # Yearly windows so a first read resumes from the last finished window instead of from 2008:
+    # doctolib/doctolib's history is about a day of requests, and GitHub fails some of them.
     incremental_sync:
       $ref: "#/definitions/server_side_since_cursor"
+      step: "P1Y"
+      cursor_granularity: "PT1S"
     state_migrations:
       - type: LegacyToPerPartitionStateMigration
     schema_loader:
@@ -17647,9 +17690,17 @@ definitions:
   # the oversized `first` was already serialized into the body, so the retry never benefited;
   # only a later page saw the smaller size, and any non-502/504 response reset it. This action
   # re-enters the fetch with a smaller `first`, which is the behavior that was intended.
+  #
+  # GitHub also reports the same deadline as HTTP 200 with an `errors` entry of type INTERNAL
+  # ("Something went wrong while executing your query"), and a page too costly to compute as
+  # RESOURCE_LIMITS_EXCEEDED. `http_codes` and `predicate` are OR'd.
   graphql_reduce_page_size_filter:
     type: HttpResponseFilter
     http_codes: [502, 504]
+    predicate: >-
+      {{ response is mapping
+         and ((response.get('errors') or []) | selectattr('type', 'defined')
+              | selectattr('type', 'in', ['INTERNAL', 'RESOURCE_LIMITS_EXCEEDED']) | list | length) > 0 }}
     action: REDUCE_PAGE_SIZE
     failure_type: transient_error
     error_message: >-
@@ -17678,7 +17729,8 @@ definitions:
       the `repo` scope or SAML SSO authorization for it. Skipping it.
 
   # GitHub's GraphQL API reports most failures as HTTP 200 with an `errors` array in the body:
-  # rate limiting (`errors[].type == "RATE_LIMITED"`), query timeouts ("Something went wrong
+  # rate limiting (`errors[].type` RATE_LIMITED, or RATE_LIMIT with code `graphql_rate_limit`
+  # when the installation is already over its budget), query timeouts ("Something went wrong
   # while executing your query") and node-limit breaches. `success_filter` matches on status
   # alone and `DefaultErrorHandler` stops at the first matching filter, so these two must come
   # before it. Without them a 200 carrying `errors` is consumed as an empty successful page:
@@ -17696,7 +17748,7 @@ definitions:
     predicate: >-
       {{ response is mapping
          and ((response.get('errors') or []) | selectattr('type', 'defined')
-              | selectattr('type', 'equalto', 'RATE_LIMITED') | list | length) > 0 }}
+              | selectattr('type', 'in', ['RATE_LIMITED', 'RATE_LIMIT']) | list | length) > 0 }}
     action: RATE_LIMITED
     error_message: "GitHub GraphQL rate limit hit. Waiting for the rate limit window to reset before retrying."
 
@@ -17707,6 +17759,15 @@ definitions:
     failure_type: transient_error
     # GitHub's own errors, truncated: without them a failing sync can't say what GitHub objected to.
     error_message: "GitHub GraphQL returned errors in the response body: {{ (response.get('errors') | string)[:500] }}. Retrying."
+
+  # A 200 whose body does not parse, seen as a response cut off mid-string, reaches the filters
+  # as `{}`. Without this `success_filter` accepts it and the paginator fails reading it.
+  graphql_unparseable_body_filter:
+    type: HttpResponseFilter
+    predicate: "{{ not response }}"
+    action: RETRY
+    failure_type: transient_error
+    error_message: "GitHub GraphQL returned a response body that is not valid JSON. Retrying."
 
   graphql_error_handler:
     type: DefaultErrorHandler
@@ -17736,6 +17797,40 @@ definitions:
       - $ref: "#/definitions/graphql_reduce_page_size_filter"
       - $ref: "#/definitions/graphql_body_not_found_skip_filter"
       - $ref: "#/definitions/graphql_body_error_filter"
+      - $ref: "#/definitions/graphql_unparseable_body_filter"
+      - $ref: "#/definitions/success_filter"
+      - $ref: "#/definitions/retry_after_rate_limit_filter"
+      - $ref: "#/definitions/primary_rate_limit_filter"
+      - $ref: "#/definitions/secondary_rate_limit_filter"
+      - $ref: "#/definitions/exhausted_quota_filter"
+      - $ref: "#/definitions/not_found_skip_filter"
+      - $ref: "#/definitions/forbidden_skip_filter"
+      - $ref: "#/definitions/gone_fail_filter"
+
+  # An asset uploader GitHub cannot resolve is reported as one INTERNAL error, with no `path`,
+  # per nulled `asset_uploaders` node. Only when the counts match exactly is the page kept,
+  # with `uploader_id` null for those assets; any other INTERNAL is still a query timeout.
+  releases_unresolved_uploader_filter:
+    type: HttpResponseFilter
+    predicate: >-
+      {%- set errors = response.get('errors') if response is mapping else none -%}
+      {%- set releases = ((response.get('data') or {}).get('repository') or {}).get('releases') if response is mapping else none -%}
+      {%- set nodes = (releases.get('nodes') or []) if releases is mapping else [] -%}
+      {{ errors is sequence and errors is not string and errors | length > 0
+         and errors | selectattr('type', 'defined') | selectattr('type', 'equalto', 'INTERNAL') | list | length == errors | length
+         and nodes | select('none') | list | length == 0
+         and nodes | map(attribute='asset_uploaders') | map(attribute='nodes') | sum(start=[]) | select('none') | list | length == errors | length }}
+    action: SUCCESS
+
+  releases_error_handler:
+    $ref: "#/definitions/graphql_error_handler"
+    response_filters:
+      - $ref: "#/definitions/releases_unresolved_uploader_filter"
+      - $ref: "#/definitions/graphql_body_rate_limited_filter"
+      - $ref: "#/definitions/graphql_reduce_page_size_filter"
+      - $ref: "#/definitions/graphql_body_not_found_skip_filter"
+      - $ref: "#/definitions/graphql_body_error_filter"
+      - $ref: "#/definitions/graphql_unparseable_body_filter"
       - $ref: "#/definitions/success_filter"
       - $ref: "#/definitions/retry_after_rate_limit_filter"
       - $ref: "#/definitions/primary_rate_limit_filter"
@@ -17762,16 +17857,16 @@ definitions:
   # its retries. Raising the budget to 6 would let them; that is a deliberate change to how
   # long a stuck partition holds a sync open, so it is not made here, but no comment or message
   # below may assume the floor was reached.
-  # `reset_policy: NEVER` keeps the reduced size for the rest of the partition:
-  # restoring it after each good page re-triggers the timeout on the next page, which is the
-  # ineffective behavior the legacy handler had. The size is local to one `_read_pages` call,
-  # so one repository reducing does not change the page size any other repository is using.
+  # `AFTER_SUCCESSFUL_PAGE`: GitHub's 502/504/INTERNAL hit scattered pages, so keeping the
+  # reduced size left a long partition (doctolib/doctolib's 264k PRs) at 1 record per request,
+  # spending the GraphQL budget for the rest of its history. The size is local to one
+  # `_read_pages` call, so one repository reducing does not change any other's page size.
   graphql_page_size_reduction:
     type: PageSizeReduction
     reduction_factor: 2
     minimum_page_size: 1
     max_attempts: 5
-    reset_policy: NEVER
+    reset_policy: AFTER_SUCCESSFUL_PAGE
     # A `REDUCE_PAGE_SIZE` response never reaches the error handler's retry budget or its
     # backoff strategies, so these two settings are the whole retry contract for a 502/504 on
     # the GraphQL endpoint, and they exist to keep it comparable to the one every other stream
@@ -17838,6 +17933,8 @@ definitions:
         $ref: "#/definitions/graphql_page_size_reduction"
       requester:
         $ref: "#/definitions/graphql_requester"
+        error_handler:
+          $ref: "#/definitions/releases_error_handler"
         request_body:
           type: RequestBodyJsonObject
           value:
@@ -17881,12 +17978,19 @@ definitions:
                           updated_at: updatedAt
                           browser_download_url: downloadUrl
                           url
+                        }
+                        pageInfo { hasNextPage }
+                      }
+                      # Kept apart from `assets`: `uploadedBy` is non-null `User!`, so an uploader GitHub
+                      # cannot resolve (a GitHub App, a deleted account) nulls its node here, not the asset.
+                      asset_uploaders: releaseAssets(first: 100) {
+                        nodes {
+                          node_id: id
                           uploader: uploadedBy {
                             __typename
                             ... on User { id: databaseId }
                           }
                         }
-                        pageInfo { hasNextPage }
                       }
                       reaction_groups: reactionGroups {
                         content
@@ -18459,56 +18563,63 @@ definitions:
       page_size_reduction:
         $ref: "#/definitions/graphql_page_size_reduction"
       requester:
-        $ref: "#/definitions/graphql_requester"
-        request_headers:
-          # https://docs.github.com/en/graphql/overview/schema-previews#merge-info-preview
-          User-Agent: "PostmanRuntime/7.28.0"
-          Accept: "application/vnd.github.merge-info-preview+json"
-        request_body:
-          type: RequestBodyJsonObject
-          value:
-            query: |
-              query PullRequestStats($owner: String!, $name: String!, $first: Int!, $after: String) {
-                repository(owner: $owner, name: $name) {
-                  pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                    nodes {
-                      node_id: id
-                      id: databaseId
-                      number
-                      updated_at: updatedAt
-                      changed_files: changedFiles
-                      deletions
-                      additions
-                      merged
-                      mergeable
-                      can_be_rebased: canBeRebased
-                      maintainer_can_modify: maintainerCanModify
-                      merge_state_status: mergeStateStatus
-                      comments { totalCount }
-                      commits { totalCount }
-                      review_comments: reviews(first: 100) {
-                        totalCount
-                        nodes { comments { totalCount } }
-                      }
-                      merged_by: mergedBy {
-                        type: __typename
-                        ... on User {
-                          node_id: id
-                          id: databaseId
-                          login
-                          avatar_url: avatarUrl
-                          html_url: url
-                          site_admin: isSiteAdmin
+        # `mergeStateStatus` is computed per request, and on some huge PRs GitHub cannot finish it
+        # before its gateway gives up, at every page size; this re-sends such a single-PR page
+        # with the field skipped instead of failing the repository on every sync. The CDK cannot see
+        # the REDUCE_PAGE_SIZE filter inside a CustomRequester and warns at startup; it still applies.
+        type: CustomRequester
+        class_name: source_declarative_manifest.components.MergeStateStatusFallbackRequester
+        requester:
+          $ref: "#/definitions/graphql_requester"
+          request_headers:
+            # https://docs.github.com/en/graphql/overview/schema-previews#merge-info-preview
+            User-Agent: "PostmanRuntime/7.28.0"
+            Accept: "application/vnd.github.merge-info-preview+json"
+          request_body:
+            type: RequestBodyJsonObject
+            value:
+              query: |
+                query PullRequestStats($owner: String!, $name: String!, $first: Int!, $after: String, $omitMergeStateStatus: Boolean = false) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                      nodes {
+                        node_id: id
+                        id: databaseId
+                        number
+                        updated_at: updatedAt
+                        changed_files: changedFiles
+                        deletions
+                        additions
+                        merged
+                        mergeable
+                        can_be_rebased: canBeRebased
+                        maintainer_can_modify: maintainerCanModify
+                        merge_state_status: mergeStateStatus @skip(if: $omitMergeStateStatus)
+                        comments { totalCount }
+                        commits { totalCount }
+                        review_comments: reviews(first: 100) {
+                          totalCount
+                          nodes { comments { totalCount } }
+                        }
+                        merged_by: mergedBy {
+                          type: __typename
+                          ... on User {
+                            node_id: id
+                            id: databaseId
+                            login
+                            avatar_url: avatarUrl
+                            html_url: url
+                            site_admin: isSiteAdmin
+                          }
                         }
                       }
+                      pageInfo { hasNextPage endCursor }
                     }
-                    pageInfo { hasNextPage endCursor }
                   }
                 }
-              }
-            variables:
-              owner: "{{ stream_partition.repository.split('/')[0] }}"
-              name: "{{ stream_partition.repository.split('/')[1] }}"
+              variables:
+                owner: "{{ stream_partition.repository.split('/')[0] }}"
+                name: "{{ stream_partition.repository.split('/')[1] }}"
       record_selector:
         type: RecordSelector
         extractor:

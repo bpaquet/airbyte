@@ -12,6 +12,7 @@ for a single repository instead of failing the whole sync.
 """
 
 import logging
+import time
 from unittest.mock import patch
 
 import pytest
@@ -322,6 +323,38 @@ def test_repeated_502_fails_the_stream(sleep_mock, rate_limit_mock_response, req
     assert error is not None
     # Retried before giving up rather than skipping the repository on the first blip.
     assert listing.call_count > 1
+
+
+@patch("time.sleep")
+def test_server_error_with_rate_limit_headers_does_not_wait_for_the_reset(sleep_mock, rate_limit_mock_response, requests_mock):
+    """GitHub sends `X-RateLimit-Reset` on a 500 too. Waiting until it stalled a production sync
+    for close to an hour per 500 while the quota was nearly untouched."""
+    config = _config("docker/compose")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    reset_in_an_hour = str(int(time.time()) + 3600)
+    requests_mock.get(
+        "https://api.github.com/repos/docker/compose/tags",
+        [
+            {
+                "status_code": 500,
+                "json": {"message": "Server Error"},
+                "headers": {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": reset_in_an_hour},
+            },
+            {
+                "status_code": 500,
+                "json": {"message": "Server Error"},
+                "headers": {"X-RateLimit-Remaining": "3999", "X-RateLimit-Reset": reset_in_an_hour},
+            },
+            {"json": [{"name": "v1"}]},
+        ],
+    )
+
+    records, statuses, error = _read(config, "tags")
+
+    assert error is None
+    assert [record["name"] for record in records] == ["v1"]
+    waits = [call.args[0] for call in sleep_mock.call_args_list if call.args and call.args[0] >= 1]
+    assert waits == [11, 21]
 
 
 @patch("time.sleep")
