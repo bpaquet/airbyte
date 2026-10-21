@@ -21,6 +21,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from freezegun import freeze_time
 
 from airbyte_cdk.models import (
     AirbyteStateBlob,
@@ -37,6 +38,17 @@ from airbyte_cdk.models import (
 )
 
 from .utils import make_source
+
+
+# `review_comments` reads yearly windows; with the clock a few months after `_START_DATE` every
+# repository is a single window, so request counts compare across the three streams.
+pytestmark = pytest.mark.usefixtures("_one_review_comments_window")
+
+
+@pytest.fixture
+def _one_review_comments_window():
+    with freeze_time("2022-12-01T00:00:00Z"):
+        yield
 
 
 # (stream name, endpoint segment under repos/{repository}/)
@@ -191,7 +203,13 @@ def test_missing_start_date_sends_2008(stream_name, endpoint, rate_limit_mock_re
     _, _, _, error = _read(config, stream_name)
 
     assert error is None
-    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2008-01-01t00:00:00z"]]
+    sinces = [request.qs["since"][0] for request in _listings(requests_mock, endpoint)]
+    if stream_name == "review_comments":
+        # One request per yearly window, the first starting at the 2008 fallback; windows run
+        # concurrently, so not in order.
+        assert sorted(sinces) == [f"{year}-01-01t00:00:00z" for year in range(2008, 2023)]
+    else:
+        assert sinces == ["2008-01-01t00:00:00z"]
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
@@ -238,13 +256,13 @@ def test_legacy_state_migrates_to_per_partition_state(stream_name, endpoint, rat
     _mock_repository_resolution(requests_mock, "docker/compose")
     requests_mock.get(f"https://api.github.com/repos/docker/compose/{endpoint}", json=[])
 
-    state = _legacy_state(stream_name, **{"docker/compose": "2025-06-01T00:00:00Z"})
+    state = _legacy_state(stream_name, **{"docker/compose": "2022-06-01T00:00:00Z"})
     _, _, states, error = _read(config, stream_name, state=state)
 
     assert error is None
-    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2025-06-01t00:00:00z"]]
+    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2022-06-01t00:00:00z"]]
     assert states[-1].stream.stream_state.states == [
-        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2025-06-01T00:00:00Z"}}
+        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2022-06-01T00:00:00Z"}}
     ]
 
 
@@ -621,3 +639,82 @@ def test_review_comments_rides_out_a_burst_of_server_errors(rate_limit_mock_resp
     assert error is None
     assert [record["id"] for record in records] == [1]
     assert max(seconds for seconds in sleeps if seconds >= 1) == 61
+
+
+_REVIEW_COMMENTS_URL = "https://api.github.com/repos/docker/compose/pulls/comments"
+
+
+def test_review_comments_are_requested_in_updated_order(rate_limit_mock_response, requests_mock):
+    """Without `sort=updated` GitHub answered 500 on every deep page of doctolib/doctolib."""
+    config = _config("docker/compose")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=[])
+
+    _, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    request = _listings(requests_mock, "pulls/comments")[0]
+    assert request.qs["sort"] == ["updated"]
+    assert request.qs["direction"] == ["asc"]
+
+
+@freeze_time("2022-12-01T00:00:00Z")
+def test_review_comments_window_stops_at_its_end_and_hands_the_overflow_to_the_next(rate_limit_mock_response, requests_mock):
+    config = _config("docker/compose", start_date="2021-01-01T00:00:00Z")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    comments = [
+        {"id": 1, "updated_at": "2021-06-01T00:00:00Z"},
+        {"id": 2, "updated_at": "2022-03-01T00:00:00Z"},
+        {"id": 3, "updated_at": "2022-09-01T00:00:00Z"},
+    ]
+    sent = []
+
+    def listing(request, context):
+        since, page = request.qs["since"][0].upper(), int(request.qs.get("page", ["1"])[0])
+        sent.append((since[:4], page))
+        matching = [comment for comment in comments if comment["updated_at"] >= since]
+        chunk = matching[page - 1 : page]
+        if page < len(matching):
+            context.headers["Link"] = f'<{_REVIEW_COMMENTS_URL}?since={since}&page={page + 1}>; rel="next"'
+        return chunk
+
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=listing)
+
+    records, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    assert sorted(record["id"] for record in records) == [1, 2, 3]
+    # The 2021 window reads page 2 (a 2022 comment), sees it is past its end and stops there.
+    assert sorted(sent) == [("2021", 1), ("2021", 2), ("2022", 1), ("2022", 2)]
+
+
+@freeze_time("2022-12-01T00:00:00Z")
+@patch("time.sleep")
+def test_review_comments_resume_from_the_last_finished_window(sleep_mock, rate_limit_mock_response, requests_mock):
+    """A first read of doctolib/doctolib is about a day of requests; a failure must not send the
+    next attempt back to the start."""
+    config = _config("docker/compose", start_date="2021-01-01T00:00:00Z")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+
+    def failing_second_window(request, context):
+        if request.qs["since"][0].startswith("2021"):
+            return [{"id": 1, "updated_at": "2021-06-01T00:00:00Z"}]
+        context.status_code = 500
+        return {"message": "Server Error"}
+
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=failing_second_window)
+    _, _, states, error = _read(config, "review_comments")
+
+    assert error is not None
+    assert states[-1].stream.stream_state.states == [
+        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2021-06-01T00:00:00Z"}}
+    ]
+
+    requests_mock.reset_mock()
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=[])
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    _read(config, "review_comments", state=[states[-1]])
+
+    # Windows are recomputed from the saved position, not from `start_date`.
+    sinces = sorted(request.qs["since"][0] for request in _listings(requests_mock, "pulls/comments"))
+    assert sinces == ["2021-06-01t00:00:00z", "2022-06-01t00:00:00z"]

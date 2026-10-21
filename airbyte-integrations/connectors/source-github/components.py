@@ -351,6 +351,44 @@ class ReleasesRecordTransformation(RecordTransformation):
 
 
 @dataclass
+class UpdatedWindowLinkPaginationStrategy(PaginationStrategy):
+    """Follows GitHub's `rel="next"` link, and stops once the page's last record, in `updated_at`
+    order, is past the window's end: `since` has no upper bound. A declarative `stop_condition`
+    cannot do it, since the decoder hands it the first record of a list body, not the last."""
+
+    config: Config
+    parameters: InitVar[Mapping[str, Any]]
+
+    @property
+    def initial_token(self) -> Optional[Any]:
+        return None
+
+    def get_page_size(self) -> Optional[int]:
+        return None
+
+    def next_page_token(
+        self,
+        response: requests.Response,
+        last_page_size: int,
+        last_record: Optional[Any],
+        last_page_token_value: Optional[Any] = None,
+        stream_slice: Optional[StreamSlice] = None,
+    ) -> Optional[Any]:
+        next_url = response.links.get("next", {}).get("url")
+        if not next_url:
+            return None
+        window_end = (stream_slice or {}).get("end_time")
+        try:
+            page = response.json()
+        except ValueError:
+            return next_url
+        if window_end and isinstance(page, list) and page and isinstance(page[-1], Mapping):
+            if (page[-1].get("updated_at") or "") > window_end:
+                return None
+        return next_url
+
+
+@dataclass
 class NestedGraphQLPaginationStrategy(PaginationStrategy):
     """Two-level cursor traversal for `reviews` and `issue_reactions`.
 
