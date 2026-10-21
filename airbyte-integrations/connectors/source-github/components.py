@@ -122,7 +122,9 @@ def _resolve_page_size(page_size: Any, config: Config) -> Optional[int]:
 # GitHub sends `X-RateLimit-Reset` on every response, errors included, so without this the header
 # strategies wait out the whole rate-limit window on a transient error while quota is left.
 _TRANSIENT_ERROR_BACKOFF_BASE_SECONDS = 10
-_TRANSIENT_ERROR_BACKOFF_MAX_SECONDS = 300
+# The CDK stops retrying a request after 10 minutes whatever `max_retries` says; a short cap
+# spends that window on attempts rather than on one long wait.
+_TRANSIENT_ERROR_BACKOFF_MAX_SECONDS = 60
 # RATE_LIMIT (code `graphql_rate_limit`) is what GitHub answers once the installation is already over.
 _GRAPHQL_RATE_LIMIT_TYPES = ("RATE_LIMITED", "RATE_LIMIT")
 

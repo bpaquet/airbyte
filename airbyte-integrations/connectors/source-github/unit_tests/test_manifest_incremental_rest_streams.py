@@ -601,3 +601,23 @@ def test_comments_two_sync_parity_with_legacy(rate_limit_mock_response, requests
         {"partition": {"repository": "airbytehq/airbyte"}, "cursor": {"updated_at": "2022-02-02T10:13:12Z"}},
         {"partition": {"repository": "organization/repository"}, "cursor": {"updated_at": "2022-02-02T10:12:12Z"}},
     ]
+
+
+def test_review_comments_rides_out_a_burst_of_server_errors(rate_limit_mock_response, requests_mock, monkeypatch):
+    """A burst of 500s longer than the default five retries failed doctolib/doctolib's first read
+    in production, which then restarted from scratch."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    config = _config("docker/compose")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    server_error = {"status_code": 500, "json": {"message": "Server Error"}}
+    requests_mock.get(
+        "https://api.github.com/repos/docker/compose/pulls/comments",
+        [server_error] * 8 + [{"json": [{"id": 1, "updated_at": "2022-03-01T00:00:00Z"}]}],
+    )
+
+    records, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    assert [record["id"] for record in records] == [1]
+    assert max(seconds for seconds in sleeps if seconds >= 1) == 61
