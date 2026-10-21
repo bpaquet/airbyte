@@ -7416,12 +7416,14 @@ definitions:
     retriever:
       $ref: "#/definitions/repository_scoped_retriever"
       requester:
-        # 30 per page, not the legacy large-stream 10: doctolib/doctolib's ~685k review comments
-        # were ~68k sequential requests. Not 100 either: GitHub pages by offset here, and past
-        # ~page 1,000 a page of 100 exceeds its 10s deadline (502) while 30 stays around 5s.
         $ref: "#/definitions/repository_scoped_requester"
+        # Without `sort=updated`, GitHub answers 500 on every deep page of a large repository
+        # (0/12 on doctolib/doctolib's ~685k comments, against 12/12 with it). The order is also
+        # what lets each window below stop at its end. 30 per page: 100 hits GitHub's 10s deadline.
         request_parameters:
           per_page: "30"
+          sort: "updated"
+          direction: "asc"
         error_handler:
           $ref: "#/definitions/review_comments_error_handler"
         # `pulls/comments`, not `review_comments`; legacy overrode `ReviewComments.path` for it.
@@ -7429,10 +7431,31 @@ definitions:
         # No `use_cache` here, unlike `comments` and `issues`. `ReviewComments.use_cache = True`
         # in Python was inert — no stream reads this one as a parent — and caching the pages of
         # a large stream costs sqlite writes for nothing.
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: []
+        # GitHub has no upper bound for `since`, so the last page of a window runs past its end;
+        # those records belong to the next window. Bounded on both sides so each record has one.
+        record_filter:
+          type: RecordFilter
+          condition: "{{ stream_interval['start_time'] <= record['updated_at'] <= stream_interval['end_time'] }}"
+      paginator:
+        type: DefaultPaginator
+        page_token_option:
+          type: RequestPath
+        pagination_strategy:
+          type: CustomPaginationStrategy
+          class_name: source_declarative_manifest.components.UpdatedWindowLinkPaginationStrategy
     transformations:
       $ref: "#/definitions/add_repository_and_rename_reactions_transformation"
+    # Yearly windows so a first read resumes from the last finished window instead of from 2008:
+    # doctolib/doctolib's history is about a day of requests, and GitHub fails some of them.
     incremental_sync:
       $ref: "#/definitions/server_side_since_cursor"
+      step: "P1Y"
+      cursor_granularity: "PT1S"
     state_migrations:
       - type: LegacyToPerPartitionStateMigration
     schema_loader:
