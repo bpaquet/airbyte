@@ -472,9 +472,9 @@ def test_comments_retries_seven_times(sleep_mock, rate_limit_mock_response, requ
 
 
 @patch("time.sleep")
-def test_review_comments_retries_five_times(sleep_mock, rate_limit_mock_response, requests_mock):
-    """The raised budget is `comments`-only; the other two keep the CDK default, which matches
-    the `GithubStreamABC.max_retries` they inherited."""
+def test_review_comments_retries_fifteen_times(sleep_mock, rate_limit_mock_response, requests_mock):
+    """`review_comments` has its own budget of 15 for GitHub's bursts of 500 on deep pages;
+    `issues` keeps the CDK default and `comments` its legacy 7."""
     config = _config("docker/compose")
     _mock_repository_resolution(requests_mock, "docker/compose")
     listing = requests_mock.get(
@@ -487,7 +487,7 @@ def test_review_comments_retries_five_times(sleep_mock, rate_limit_mock_response
 
     assert statuses[-1] == "INCOMPLETE"
     assert error is not None
-    assert listing.call_count == 6  # the first attempt plus five retries
+    assert listing.call_count == 16  # the first attempt plus fifteen retries
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
