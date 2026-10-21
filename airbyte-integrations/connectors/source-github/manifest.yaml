@@ -531,6 +531,13 @@ definitions:
     $ref: "#/definitions/skip_inaccessible_error_handler"
     max_retries: 7
 
+  # GitHub answers bursts of 500 on deep `pulls/comments` pages; a burst outlasting five
+  # retries failed doctolib/doctolib's first read, which restarts from scratch. The CDK still
+  # caps the retries of one request at 10 minutes.
+  review_comments_error_handler:
+    $ref: "#/definitions/skip_inaccessible_error_handler"
+    max_retries: 15
+
   # `repository_stats` resolves the explicit `org/repo` entries the user typed, and a 403 there
   # is one repository the token cannot see — a SAML-protected org is the common case. It must not
   # take the other repositories down with it: a 403 raised while partitions are being generated
@@ -7425,6 +7432,8 @@ definitions:
         $ref: "#/definitions/repository_scoped_requester"
         request_parameters:
           per_page: "30"
+        error_handler:
+          $ref: "#/definitions/review_comments_error_handler"
         # `pulls/comments`, not `review_comments`; legacy overrode `ReviewComments.path` for it.
         path: "repos/{{ stream_partition.repository }}/pulls/comments"
         # No `use_cache` here, unlike `comments` and `issues`. `ReviewComments.use_cache = True`
