@@ -10,7 +10,7 @@ Each of these streams slices on the records of another stream: `PullRequestCommi
 `Issues`, and the two reaction streams read `CommitComments` and `Comments`. The Python classes
 read their parent in full refresh from `start_date`, stamped the parent's identifiers onto every
 child record, and — for the four incremental ones — filtered client-side on a cursor kept per
-parent record. The tests below assert parity with that, or pin the deliberate divergences.
+parent record. `pull_request_commits` has since become incremental through its parent's state. The tests below assert parity with that, or pin the deliberate divergences.
 """
 
 import json
@@ -48,7 +48,7 @@ MIGRATED_STREAMS = [
     "commit_comment_reactions",
     "issue_comment_reactions",
 ]
-INCREMENTAL_STREAMS = {"project_columns", "project_cards", "commit_comment_reactions", "issue_comment_reactions"}
+INCREMENTAL_STREAMS = {"pull_request_commits", "project_columns", "project_cards", "commit_comment_reactions", "issue_comment_reactions"}
 
 _TOKEN_CONFIG = {"credentials": {"personal_access_token": "token"}}
 _START_DATE = "2022-01-01T00:00:00Z"
@@ -147,7 +147,7 @@ SINGLE_PARENT_CASES = [
         ],
         "/pulls/7/commits",
         {"per_page": ["100"]},
-        [{"sha": "a", "repository": _REPO, "pull_number": 7}],
+        [{"sha": "a", "repository": _REPO, "pull_number": 7, "pull_request_updated_at": _AFTER_START}],
         id="pull_request_commits",
     ),
     pytest.param(
@@ -269,7 +269,10 @@ def test_streams_are_served_by_the_manifest_only(rate_limit_mock_response, reque
     assert by_name["team_memberships"].source_defined_primary_key == [["url"]]
     assert by_name["issue_timeline_events"].source_defined_primary_key == [["repository"], ["issue_number"]]
     for name in INCREMENTAL_STREAMS:
-        assert by_name[name].default_cursor_field == (["created_at"] if name.endswith("reactions") else ["updated_at"])
+        expected_cursor = {"pull_request_commits": ["pull_request_updated_at"]}.get(
+            name, ["created_at"] if name.endswith("reactions") else ["updated_at"]
+        )
+        assert by_name[name].default_cursor_field == expected_cursor
         assert by_name[name].supported_sync_modes == [SyncMode.full_refresh, SyncMode.incremental]
     for name in set(MIGRATED_STREAMS) - INCREMENTAL_STREAMS:
         assert by_name[name].supported_sync_modes == [SyncMode.full_refresh]
@@ -363,10 +366,10 @@ def test_pull_request_commits_legacy_scenario(rate_limit_mock_response, requests
 
     assert error is None
     assert sorted(records, key=lambda record: record["sha"]) == [
-        {"sha": 1, "repository": "organization/repository", "pull_number": 2},
-        {"sha": 2, "repository": "organization/repository", "pull_number": 2},
-        {"sha": 3, "repository": "organization/repository", "pull_number": 3},
-        {"sha": 4, "repository": "organization/repository", "pull_number": 3},
+        {"sha": 1, "repository": "organization/repository", "pull_number": 2, "pull_request_updated_at": "2022-02-02T10:10:04Z"},
+        {"sha": 2, "repository": "organization/repository", "pull_number": 2, "pull_request_updated_at": "2022-02-02T10:10:04Z"},
+        {"sha": 3, "repository": "organization/repository", "pull_number": 3, "pull_request_updated_at": "2022-02-02T10:10:06Z"},
+        {"sha": 4, "repository": "organization/repository", "pull_number": 3, "pull_request_updated_at": "2022-02-02T10:10:06Z"},
     ]
     assert _requested(requests_mock, "/pulls/1/commits") == []
 
@@ -712,3 +715,40 @@ def test_issue_timeline_events_odd_bodies_yield_the_bare_record(response, rate_l
     assert error is None
     assert statuses[-1] == "COMPLETE"
     assert records == [{"repository": _REPO, "issue_number": 3}]
+
+
+def test_pull_request_commits_second_sync_only_expands_pull_requests_updated_since(rate_limit_mock_response, requests_mock):
+    """Each repository resumes from its own `pull_requests` position. A pull request updated
+    after its repository's last sync is expanded even when it is older than another repository's
+    newest pull request, which a single client-side cursor across repositories would drop."""
+    lagging, leading = "docker/compose", "docker/cli"
+    config = _config(lagging, leading)
+    _mock_repository_resolution(requests_mock, lagging, leading)
+    requests_mock.get(f"{_API}/repos/{lagging}/pulls", json=[_record(id=7, number=7, updated_at=_AFTER_START, head={}, base={})])
+    requests_mock.get(f"{_API}/repos/{leading}/pulls", json=[_record(id=8, number=8, updated_at=_LATER, head={}, base={})])
+    requests_mock.get(f"{_API}/repos/{lagging}/pulls/7/commits", json=[{"sha": "a"}])
+    requests_mock.get(f"{_API}/repos/{leading}/pulls/8/commits", json=[{"sha": "b"}])
+
+    first, _, states, error = _read(config, "pull_request_commits")
+
+    assert error is None
+    assert sorted(record["sha"] for record in first) == ["a", "b"]
+
+    between = "2022-06-15T00:00:00Z"
+    requests_mock.get(
+        f"{_API}/repos/{lagging}/pulls",
+        json=[
+            _record(id=9, number=9, updated_at=between, head={}, base={}),
+            _record(id=7, number=7, updated_at=_AFTER_START, head={}, base={}),
+            _record(id=6, number=6, updated_at="2022-03-01T00:00:00Z", head={}, base={}),
+        ],
+    )
+    requests_mock.get(f"{_API}/repos/{lagging}/pulls/9/commits", json=[{"sha": "c"}])
+    requests_mock.get(f"{_API}/repos/{lagging}/pulls/6/commits", json=[{"sha": "d"}])
+    requests_mock.reset_mock()
+
+    second, _, _, error = _read(config, "pull_request_commits", state=[states[-1]])
+
+    assert error is None
+    assert {"sha": "c", "repository": lagging, "pull_number": 9, "pull_request_updated_at": between} in second
+    assert _requested(requests_mock, "/pulls/6/commits") == []

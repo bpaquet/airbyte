@@ -7774,8 +7774,12 @@ definitions:
               $ref: "#/definitions/pull_requests_stream"
             parent_key: "number"
             partition_field: "pull_number"
+            # Only pull requests updated since the last sync are expanded; a push to a pull
+            # request bumps its updated_at, so new commits are not missed.
+            incremental_dependency: true
             extra_fields:
               - ["repository"]
+              - ["updated_at"]
     transformations:
       - type: AddFields
         fields:
@@ -7783,6 +7787,14 @@ definitions:
             value: "{{ stream_slice.extra_fields['repository'] }}"
           - path: ["pull_number"]
             value: "{{ stream_partition.pull_number }}"
+          - path: ["pull_request_updated_at"]
+            value: "{{ stream_slice.extra_fields['updated_at'] }}"
+    # Not client-side filtered: the parent's per-repository state decides which pull requests
+    # are read, and one global cursor across repositories would drop a lagging repository's.
+    incremental_sync:
+      $ref: "#/definitions/semi_incremental_cursor_base"
+      cursor_field: "pull_request_updated_at"
+      global_substream_cursor: true
     schema_loader:
       type: InlineSchemaLoader
       schema:
@@ -8088,6 +8100,12 @@ definitions:
           pull_number:
             description: Number associated with the pull request.
             type: integer
+          pull_request_updated_at:
+            description: When the pull request was last updated, as read for this sync.
+            type:
+              - "null"
+              - string
+            format: date-time
 
   project_columns_stream:
     # API docs: https://docs.github.com/en/rest/projects/columns?apiVersion=2022-11-28#list-project-columns
