@@ -288,14 +288,14 @@ The GitHub REST and GraphQL APIs support `since` parameter on many list endpoint
 | `comments` | incremental | `updated_at` | server-side `since` | |
 | `issues` | incremental | `updated_at` | server-side `since` | |
 | `review_comments` | incremental | `updated_at` | server-side `since` | |
-| `pull_request_commits` | full refresh | — | — | substream of `pull_requests` |
+| `pull_request_commits` | incremental | `pull_request_updated_at` | parent state (`incremental_dependency`) | substream of `pull_requests`; only pull requests updated since the last sync are expanded |
 | `project_columns` | incremental | `updated_at` | client-side | substream of `projects` |
 | `project_cards` | incremental | `updated_at` | client-side | substream of `project_columns` |
 | `team_members` | full refresh | — | — | substream of `teams` |
 | `team_memberships` | full refresh | — | — | substream of `team_members` |
 | `issue_timeline_events` | full refresh | — | — | substream of `issues` |
 | `commit_comment_reactions` | incremental | `created_at` | client-side | substream of `commit_comments` |
-| `issue_comment_reactions` | incremental | `created_at` | client-side | substream of `comments` |
+| `issue_comment_reactions` | incremental | `created_at` | parent state (`incremental_dependency`) | substream of `comments`; only comments updated since the last sync are expanded |
 | `commits` | incremental | `created_at` | server-side `since` | slices per branch via `CommitsBranchPartitionRouter` |
 | `contributor_activity` | full refresh | — | — | retries 202 with a 90s constant backoff |
 | `workflow_runs` | incremental | `updated_at` | client-side, 32-day window | `CursorPagination` `stop_condition` on `stream_interval` |
@@ -310,7 +310,7 @@ The GitHub REST and GraphQL APIs support `since` parameter on many list endpoint
 - **The five streams migrated in Step 3** (`assignees`, `branches`, `collaborators`, `issue_labels`, `tags`) have no usable cursor: none of their endpoints returns an `updated_at`/`created_at` field or accepts `since`, so they stay full refresh.
 - **The nine streams migrated in Step 5** (`events`, `pull_requests`, `commit_comments`, `issue_milestones`, `stargazers`, `projects`, `issue_events`, `deployments`, `workflows`) have a cursor field but no server-side filter, so they are client-side incremental; `pull_requests` and `issue_milestones` additionally sort newest-first and use the data-feed stop condition. See the semi-incremental bullet above before adding another.
 - **The three streams migrated in Step 6** (`comments`, `issues`, `review_comments`) are the connector's only REST streams that filter server-side: their endpoints accept `since` and the declarative `DatetimeBasedCursor` injects it via `start_time_option`. Any further stream whose endpoint accepts `since` belongs in that group rather than the client-side-filtered one.
-- **The eight streams migrated in Step 7** (`pull_request_commits`, `project_columns`, `project_cards`, `team_members`, `team_memberships`, `issue_timeline_events`, `commit_comment_reactions`, `issue_comment_reactions`) are substreams. `project_columns`, `project_cards` and the two reaction streams are client-side incremental with a cursor per parent record; the other four have no cursor and stay full refresh.
+- **The eight streams migrated in Step 7** (`pull_request_commits`, `project_columns`, `project_cards`, `team_members`, `team_memberships`, `issue_timeline_events`, `commit_comment_reactions`, `issue_comment_reactions`) are substreams. `project_columns`, `project_cards` and `commit_comment_reactions` are client-side incremental with a cursor per parent record. `pull_request_commits` and `issue_comment_reactions` are incremental through `incremental_dependency`: the parent `pull_requests` resumes per repository, and the child's global cursor on `pull_request_updated_at` is not client-side filtered, because one cursor across repositories would drop records of a repository that lags behind. A reaction does not bump its comment's `updated_at`, so `issue_comment_reactions` misses reactions added to an otherwise unchanged comment; `PerPartitionToGlobalCursorStateMigration` collapses its older per-comment state, and a state without `parent_state` re-reads every comment once. The other three have no cursor and stay full refresh.
 - **The four streams migrated in Step 8** (`commits`, `contributor_activity`, `workflow_runs`, `workflow_jobs`): `commits` filters server-side with `since` per branch, `workflow_runs` and `workflow_jobs` are client-side incremental with the 32-day `created` window described above, `contributor_activity` has no cursor and stays full refresh.
 - The GraphQL error contract is carried by the _order_ of `graphql_error_handler.response_filters`,
   not by the filters alone. GitHub reports GraphQL failures in the body — on a 200 and on a

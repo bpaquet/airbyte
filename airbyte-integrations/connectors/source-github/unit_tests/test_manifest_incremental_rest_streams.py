@@ -21,6 +21,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from freezegun import freeze_time
 
 from airbyte_cdk.models import (
     AirbyteStateBlob,
@@ -39,12 +40,26 @@ from airbyte_cdk.models import (
 from .utils import make_source
 
 
+# `review_comments` reads yearly windows; with the clock a few months after `_START_DATE` every
+# repository is a single window, so request counts compare across the three streams.
+pytestmark = pytest.mark.usefixtures("_one_review_comments_window")
+
+
+@pytest.fixture
+def _one_review_comments_window():
+    with freeze_time("2022-12-01T00:00:00Z"):
+        yield
+
+
 # (stream name, endpoint segment under repos/{repository}/)
 MIGRATED_STREAMS = [
     ("comments", "issues/comments"),
     ("issues", "issues"),
     ("review_comments", "pulls/comments"),
 ]
+
+# `review_comments` left the legacy large-stream page size; see its requester.
+_PER_PAGE = {"comments": "10", "issues": "10", "review_comments": "30"}
 
 _TOKEN_CONFIG = {"credentials": {"personal_access_token": "token"}}
 _START_DATE = "2022-02-02T10:10:01Z"
@@ -188,7 +203,13 @@ def test_missing_start_date_sends_2008(stream_name, endpoint, rate_limit_mock_re
     _, _, _, error = _read(config, stream_name)
 
     assert error is None
-    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2008-01-01t00:00:00z"]]
+    sinces = [request.qs["since"][0] for request in _listings(requests_mock, endpoint)]
+    if stream_name == "review_comments":
+        # One request per yearly window, the first starting at the 2008 fallback; windows run
+        # concurrently, so not in order.
+        assert sorted(sinces) == [f"{year}-01-01t00:00:00z" for year in range(2008, 2023)]
+    else:
+        assert sinces == ["2008-01-01t00:00:00z"]
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
@@ -235,13 +256,13 @@ def test_legacy_state_migrates_to_per_partition_state(stream_name, endpoint, rat
     _mock_repository_resolution(requests_mock, "docker/compose")
     requests_mock.get(f"https://api.github.com/repos/docker/compose/{endpoint}", json=[])
 
-    state = _legacy_state(stream_name, **{"docker/compose": "2025-06-01T00:00:00Z"})
+    state = _legacy_state(stream_name, **{"docker/compose": "2022-06-01T00:00:00Z"})
     _, _, states, error = _read(config, stream_name, state=state)
 
     assert error is None
-    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2025-06-01t00:00:00z"]]
+    assert [request.qs["since"] for request in _listings(requests_mock, endpoint)] == [["2022-06-01t00:00:00z"]]
     assert states[-1].stream.stream_state.states == [
-        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2025-06-01T00:00:00Z"}}
+        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2022-06-01T00:00:00Z"}}
     ]
 
 
@@ -253,11 +274,16 @@ def test_legacy_state_migrates_to_per_partition_state(stream_name, endpoint, rat
         pytest.param({"page_size_for_large_streams": None}, id="deprecated_key_null"),
     ],
 )
-@pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
-def test_page_size_is_the_large_stream_page_size(stream_name, endpoint, page_size_config, rate_limit_mock_response, requests_mock):
-    """All three were `large_stream = True`, so their `per_page` is
-    `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` (10) rather than the 100 the full-refresh
-    group sends.
+@pytest.mark.parametrize(
+    ("stream_name", "endpoint", "per_page"),
+    [(stream_name, endpoint, _PER_PAGE[stream_name]) for stream_name, endpoint in MIGRATED_STREAMS],
+)
+def test_page_size_is_the_large_stream_page_size(
+    stream_name, endpoint, per_page, page_size_config, rate_limit_mock_response, requests_mock
+):
+    """All three were `large_stream = True`, so `comments` and `issues` send
+    `constants.DEFAULT_PAGE_SIZE_FOR_LARGE_STREAM` (10). `review_comments` sends 30: 10 took about
+    100 hours on a repository with ~685k review comments, and 100 hit GitHub's 502 on deep pages.
 
     The deprecated `page_size_for_large_streams` no longer changes it. The key left the spec in
     1.0.1, so a config still carrying it was set through the API or Terraform, and a null there
@@ -269,7 +295,7 @@ def test_page_size_is_the_large_stream_page_size(stream_name, endpoint, page_siz
     _, _, _, error = _read(config, stream_name)
 
     assert error is None
-    assert [request.qs["per_page"] for request in _listings(requests_mock, endpoint)] == [["10"]]
+    assert [request.qs["per_page"] for request in _listings(requests_mock, endpoint)] == [[per_page]]
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
@@ -306,9 +332,10 @@ def test_pagination_follows_next_link_with_after_cursor(stream_name, endpoint, r
     The whole next URL must be followed, with `after` decoded exactly once."""
     config = _config("docker/compose")
     _mock_repository_resolution(requests_mock, "docker/compose")
+    per_page = _PER_PAGE[stream_name]
     next_url = (
         f"https://api.github.com/repositories/1/{endpoint}"
-        "?per_page=10&state=all&sort=updated&direction=asc&since=2022-02-02T10%3A10%3A01Z"
+        f"?per_page={per_page}&state=all&sort=updated&direction=asc&since=2022-02-02T10%3A10%3A01Z"
         "&page={page}&after={cursor}"
     )
     after_cursors = {
@@ -356,7 +383,7 @@ def test_pagination_follows_next_link_with_after_cursor(stream_name, endpoint, r
         assert set(query["state"]) == {"all"}
         assert set(query["sort"]) == {"updated"}
         assert set(query["direction"]) == {"asc"}
-        assert set(query["per_page"]) == {"10"}
+        assert set(query["per_page"]) == {per_page}
 
 
 def test_issues_sends_the_legacy_base_params(rate_limit_mock_response, requests_mock):
@@ -463,9 +490,9 @@ def test_comments_retries_seven_times(sleep_mock, rate_limit_mock_response, requ
 
 
 @patch("time.sleep")
-def test_review_comments_retries_five_times(sleep_mock, rate_limit_mock_response, requests_mock):
-    """The raised budget is `comments`-only; the other two keep the CDK default, which matches
-    the `GithubStreamABC.max_retries` they inherited."""
+def test_review_comments_retries_fifteen_times(sleep_mock, rate_limit_mock_response, requests_mock):
+    """`review_comments` has its own budget of 15 for GitHub's bursts of 500 on deep pages;
+    `issues` keeps the CDK default and `comments` its legacy 7."""
     config = _config("docker/compose")
     _mock_repository_resolution(requests_mock, "docker/compose")
     listing = requests_mock.get(
@@ -478,7 +505,7 @@ def test_review_comments_retries_five_times(sleep_mock, rate_limit_mock_response
 
     assert statuses[-1] == "INCOMPLETE"
     assert error is not None
-    assert listing.call_count == 6  # the first attempt plus five retries
+    assert listing.call_count == 16  # the first attempt plus fifteen retries
 
 
 @pytest.mark.parametrize(("stream_name", "endpoint"), MIGRATED_STREAMS)
@@ -592,3 +619,102 @@ def test_comments_two_sync_parity_with_legacy(rate_limit_mock_response, requests
         {"partition": {"repository": "airbytehq/airbyte"}, "cursor": {"updated_at": "2022-02-02T10:13:12Z"}},
         {"partition": {"repository": "organization/repository"}, "cursor": {"updated_at": "2022-02-02T10:12:12Z"}},
     ]
+
+
+def test_review_comments_rides_out_a_burst_of_server_errors(rate_limit_mock_response, requests_mock, monkeypatch):
+    """A burst of 500s longer than the default five retries failed doctolib/doctolib's first read
+    in production, which then restarted from scratch."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    config = _config("docker/compose")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    server_error = {"status_code": 500, "json": {"message": "Server Error"}}
+    requests_mock.get(
+        "https://api.github.com/repos/docker/compose/pulls/comments",
+        [server_error] * 8 + [{"json": [{"id": 1, "updated_at": "2022-03-01T00:00:00Z"}]}],
+    )
+
+    records, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    assert [record["id"] for record in records] == [1]
+    assert max(seconds for seconds in sleeps if seconds >= 1) == 61
+
+
+_REVIEW_COMMENTS_URL = "https://api.github.com/repos/docker/compose/pulls/comments"
+
+
+def test_review_comments_are_requested_in_updated_order(rate_limit_mock_response, requests_mock):
+    """Without `sort=updated` GitHub answered 500 on every deep page of doctolib/doctolib."""
+    config = _config("docker/compose")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=[])
+
+    _, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    request = _listings(requests_mock, "pulls/comments")[0]
+    assert request.qs["sort"] == ["updated"]
+    assert request.qs["direction"] == ["asc"]
+
+
+@freeze_time("2022-12-01T00:00:00Z")
+def test_review_comments_window_stops_at_its_end_and_hands_the_overflow_to_the_next(rate_limit_mock_response, requests_mock):
+    config = _config("docker/compose", start_date="2021-01-01T00:00:00Z")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    comments = [
+        {"id": 1, "updated_at": "2021-06-01T00:00:00Z"},
+        {"id": 2, "updated_at": "2022-03-01T00:00:00Z"},
+        {"id": 3, "updated_at": "2022-09-01T00:00:00Z"},
+    ]
+    sent = []
+
+    def listing(request, context):
+        since, page = request.qs["since"][0].upper(), int(request.qs.get("page", ["1"])[0])
+        sent.append((since[:4], page))
+        matching = [comment for comment in comments if comment["updated_at"] >= since]
+        chunk = matching[page - 1 : page]
+        if page < len(matching):
+            context.headers["Link"] = f'<{_REVIEW_COMMENTS_URL}?since={since}&page={page + 1}>; rel="next"'
+        return chunk
+
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=listing)
+
+    records, _, _, error = _read(config, "review_comments")
+
+    assert error is None
+    assert sorted(record["id"] for record in records) == [1, 2, 3]
+    # The 2021 window reads page 2 (a 2022 comment), sees it is past its end and stops there.
+    assert sorted(sent) == [("2021", 1), ("2021", 2), ("2022", 1), ("2022", 2)]
+
+
+@freeze_time("2022-12-01T00:00:00Z")
+@patch("time.sleep")
+def test_review_comments_resume_from_the_last_finished_window(sleep_mock, rate_limit_mock_response, requests_mock):
+    """A first read of doctolib/doctolib is about a day of requests; a failure must not send the
+    next attempt back to the start."""
+    config = _config("docker/compose", start_date="2021-01-01T00:00:00Z")
+    _mock_repository_resolution(requests_mock, "docker/compose")
+
+    def failing_second_window(request, context):
+        if request.qs["since"][0].startswith("2021"):
+            return [{"id": 1, "updated_at": "2021-06-01T00:00:00Z"}]
+        context.status_code = 500
+        return {"message": "Server Error"}
+
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=failing_second_window)
+    _, _, states, error = _read(config, "review_comments")
+
+    assert error is not None
+    assert states[-1].stream.stream_state.states == [
+        {"partition": {"repository": "docker/compose"}, "cursor": {"updated_at": "2021-06-01T00:00:00Z"}}
+    ]
+
+    requests_mock.reset_mock()
+    requests_mock.get(_REVIEW_COMMENTS_URL, json=[])
+    _mock_repository_resolution(requests_mock, "docker/compose")
+    _read(config, "review_comments", state=[states[-1]])
+
+    # Windows are recomputed from the saved position, not from `start_date`.
+    sinces = sorted(request.qs["since"][0] for request in _listings(requests_mock, "pulls/comments"))
+    assert sinces == ["2021-06-01t00:00:00z", "2022-06-01t00:00:00z"]
