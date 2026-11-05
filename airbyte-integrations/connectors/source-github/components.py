@@ -647,6 +647,33 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
 
 
 @dataclass
+class PerPartitionToGlobalCursorStateMigration(StateMigration):
+    """Collapse a per-partition substream state into the global-cursor shape.
+
+    A global substream cursor cannot parse `{"states": [...]}` without a top-level `state`. The
+    cursor value is only informational here (the parent state decides what is read), so the
+    newest partition cursor is kept and the parent state, if any, is preserved.
+    """
+
+    config: Config
+    parameters: Mapping[str, Any]
+    cursor_field: str
+
+    def should_migrate(self, stream_state: Mapping[str, Any]) -> bool:
+        return bool(stream_state) and "states" in stream_state and "state" not in stream_state
+
+    def migrate(self, stream_state: Mapping[str, Any]) -> Mapping[str, Any]:
+        values = [entry.get("cursor", {}).get(self.cursor_field) for entry in stream_state.get("states") or []]
+        values = [value for value in values if value]
+        migrated: MutableMapping[str, Any] = {"use_global_cursor": True}
+        if values:
+            migrated["state"] = {self.cursor_field: max(values)}
+        if stream_state.get("parent_state"):
+            migrated["parent_state"] = stream_state["parent_state"]
+        return migrated
+
+
+@dataclass
 class IssueTimelineEventsExtractor(RecordExtractor):
     """Collapse an issue's timeline page into one record keyed by event type.
 
