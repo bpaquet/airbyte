@@ -15730,6 +15730,9 @@ definitions:
               $ref: "#/definitions/comments_stream"
             parent_key: "id"
             partition_field: "comment_id"
+            # Only comments updated since the last sync are expanded. A reaction does not bump the
+            # comment's updated_at, so reactions added to an otherwise unchanged comment are missed.
+            incremental_dependency: true
             extra_fields:
               - ["repository"]
     transformations:
@@ -15739,14 +15742,20 @@ definitions:
             value: "{{ stream_slice.extra_fields['repository'] }}"
           - path: ["comment_id"]
             value: "{{ stream_partition.comment_id }}"
+    # Not client-side filtered: the parent's per-repository state decides which comments are read,
+    # and one global cursor across repositories would drop a lagging repository's reactions.
     incremental_sync:
-      $ref: "#/definitions/client_side_filtered_cursor"
+      $ref: "#/definitions/semi_incremental_cursor_base"
       cursor_field: "created_at"
+      global_substream_cursor: true
     state_migrations:
       - type: CustomStateMigration
         class_name: source_declarative_manifest.components.NestedLegacyToPerPartitionStateMigration
         cursor_field: "created_at"
         partition_fields: ["comment_id"]
+      - type: CustomStateMigration
+        class_name: source_declarative_manifest.components.PerPartitionToGlobalCursorStateMigration
+        cursor_field: "created_at"
     schema_loader:
       type: InlineSchemaLoader
       schema:

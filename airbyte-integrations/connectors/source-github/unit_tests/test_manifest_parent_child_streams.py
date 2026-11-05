@@ -591,19 +591,6 @@ def test_commit_comment_reactions_two_syncs_legacy_scenario(rate_limit_mock_resp
             [90, 91],
             id="commit_comment_reactions",
         ),
-        pytest.param(
-            "issue_comment_reactions",
-            {_REPO: {"8": {"created_at": _AFTER_START}}},
-            [
-                (f"{_API}/repos/{_REPO}/issues/comments", [_record(id=8, updated_at=_LATER)]),
-                (
-                    f"{_API}/repos/{_REPO}/issues/comments/8/reactions",
-                    [_record(id=80, created_at=_LATER), _record(id=81, created_at=_AFTER_START), _record(id=82, created_at=_BEFORE_START)],
-                ),
-            ],
-            [80, 81],
-            id="issue_comment_reactions",
-        ),
     ],
 )
 def test_legacy_nested_state_is_migrated_per_partition(
@@ -752,3 +739,76 @@ def test_pull_request_commits_second_sync_only_expands_pull_requests_updated_sin
     assert error is None
     assert {"sha": "c", "repository": lagging, "pull_number": 9, "pull_request_updated_at": between} in second
     assert _requested(requests_mock, "/pulls/6/commits") == []
+
+
+def _comments_since(comments):
+    """Answer `issues/comments` like GitHub: only comments updated at or after `since`."""
+
+    def respond(request, context):
+        since = (request.qs.get("since") or [""])[0].upper()
+        return [comment for comment in comments if comment["updated_at"] >= since]
+
+    return respond
+
+
+def test_issue_comment_reactions_second_sync_only_expands_comments_updated_since(rate_limit_mock_response, requests_mock):
+    """Each repository resumes `comments` from its own position, so only comments updated since
+    the last sync are expanded, including in a repository that lags behind another one."""
+    lagging, leading = "docker/compose", "docker/cli"
+    config = _config(lagging, leading)
+    _mock_repository_resolution(requests_mock, lagging, leading)
+    between = "2022-06-15T00:00:00Z"
+    lagging_comments = [_record(id=7, updated_at=_AFTER_START)]
+    requests_mock.get(f"{_API}/repos/{lagging}/issues/comments", json=_comments_since(lagging_comments))
+    requests_mock.get(f"{_API}/repos/{leading}/issues/comments", json=_comments_since([_record(id=8, updated_at=_LATER)]))
+    requests_mock.get(f"{_API}/repos/{lagging}/issues/comments/7/reactions", json=[_record(id=70, created_at=_AFTER_START)])
+    requests_mock.get(f"{_API}/repos/{leading}/issues/comments/8/reactions", json=[_record(id=80, created_at=_LATER)])
+
+    first, _, states, error = _read(config, "issue_comment_reactions")
+
+    assert error is None
+    assert sorted(record["id"] for record in first) == [70, 80]
+
+    lagging_comments += [_record(id=6, updated_at="2022-03-01T00:00:00Z"), _record(id=9, updated_at=between)]
+    requests_mock.get(f"{_API}/repos/{lagging}/issues/comments/9/reactions", json=[_record(id=90, created_at=_BEFORE_START)])
+    requests_mock.get(f"{_API}/repos/{lagging}/issues/comments/6/reactions", json=[_record(id=60, created_at=_BEFORE_START)])
+    requests_mock.reset_mock()
+
+    second, _, _, error = _read(config, "issue_comment_reactions", state=[states[-1]])
+
+    assert error is None
+    assert {"id": 90, "created_at": _BEFORE_START, "repository": lagging, "comment_id": 9} in second
+    assert _requested(requests_mock, "/issues/comments/6/reactions") == []
+
+
+@pytest.mark.parametrize(
+    "saved_state",
+    [
+        pytest.param({_REPO: {"8": {"created_at": _AFTER_START}}}, id="legacy_nested"),
+        pytest.param(
+            {"states": [{"partition": {"comment_id": 8, "parent_slice": {"repository": _REPO}}, "cursor": {"created_at": _AFTER_START}}]},
+            id="per_partition",
+        ),
+        pytest.param({"state": {"created_at": _AFTER_START}, "parent_state": {}, "lookback_window": 1, "use_global_cursor": True}, id="global"),
+    ],
+)
+def test_issue_comment_reactions_states_without_parent_state_reread_every_comment_once(
+    saved_state, rate_limit_mock_response, requests_mock
+):
+    """States written before the parent state was tracked carry no `comments` position: the first
+    sync after the upgrade expands every comment from `start_date` and saves that position."""
+    config = _config(_REPO)
+    _mock_repository_resolution(requests_mock, _REPO)
+    requests_mock.get(f"{_API}/repos/{_REPO}/issues/comments", json=_comments_since([_record(id=8, updated_at=_AFTER_START)]))
+    requests_mock.get(
+        f"{_API}/repos/{_REPO}/issues/comments/8/reactions",
+        json=[_record(id=80, created_at=_LATER), _record(id=82, created_at=_BEFORE_START)],
+    )
+
+    records, _, states, error = _read(config, "issue_comment_reactions", state=_state_message("issue_comment_reactions", saved_state))
+
+    assert error is None
+    assert sorted(record["id"] for record in records) == [80, 82]
+    final = states[-1].stream.stream_state.__dict__
+    assert final["parent_state"]["comments"]
+    assert "states" not in final or final.get("use_global_cursor")
