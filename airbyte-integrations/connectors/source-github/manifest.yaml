@@ -6192,12 +6192,39 @@ definitions:
         # legacy behavior, since `ReactionStream` passed `start_date` there too.
         # TODO(https://github.com/airbytehq/airbyte-internal-issues/issues/16517): drop with Step 7.
         use_cache: true
+        # Without `sort=updated`, GitHub answers 500 from the first page once `since` reaches back
+        # a few weeks on a large repository, as on `review_comments`; the order also lets each
+        # window below stop at its end.
+        request_parameters:
+          per_page:
+            $ref: "#/definitions/large_stream_page_size"
+          sort: "updated"
+          direction: "asc"
         error_handler:
           $ref: "#/definitions/comments_error_handler"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: []
+        # The last page of a window runs past its end; those records belong to the next window.
+        record_filter:
+          type: RecordFilter
+          condition: "{{ stream_interval['start_time'] <= record['updated_at'] <= stream_interval['end_time'] }}"
+      paginator:
+        type: DefaultPaginator
+        page_token_option:
+          type: RequestPath
+        pagination_strategy:
+          type: CustomPaginationStrategy
+          class_name: source_declarative_manifest.components.UpdatedWindowLinkPaginationStrategy
     transformations:
       $ref: "#/definitions/add_repository_and_rename_reactions_transformation"
+    # Yearly windows so a long read resumes from the last finished window instead of from 2008.
     incremental_sync:
       $ref: "#/definitions/server_side_since_cursor"
+      step: "P1Y"
+      cursor_granularity: "PT1S"
     state_migrations:
       - type: LegacyToPerPartitionStateMigration
     schema_loader:
