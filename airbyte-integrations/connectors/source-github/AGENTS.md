@@ -288,7 +288,7 @@ The GitHub REST and GraphQL APIs support `since` parameter on many list endpoint
 | `comments` | incremental | `updated_at` | server-side `since` | |
 | `issues` | incremental | `updated_at` | server-side `since` | |
 | `review_comments` | incremental | `updated_at` | server-side `since` | |
-| `pull_request_commits` | incremental | `pull_request_updated_at` | parent state (`incremental_dependency`) | substream of `pull_requests`; only pull requests updated since the last sync are expanded |
+| `pull_request_commits` | incremental | `pull_request_updated_at` | parent state (`incremental_dependency`) | substream of `pull_requests`; only pull requests updated since the last sync are expanded; keyed on `repository`, `pull_number`, `sha` |
 | `project_columns` | incremental | `updated_at` | client-side | substream of `projects` |
 | `project_cards` | incremental | `updated_at` | client-side | substream of `project_columns` |
 | `team_members` | full refresh | — | — | substream of `teams` |

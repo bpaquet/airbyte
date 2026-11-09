@@ -264,7 +264,7 @@ def test_streams_are_served_by_the_manifest_only(rate_limit_mock_response, reque
     assert set(MIGRATED_STREAMS) <= {stream.name for stream in discovered}
     assert len(discovered) == len({stream.name for stream in discovered})
     by_name = {stream.name: stream for stream in discovered}
-    assert by_name["pull_request_commits"].source_defined_primary_key == [["sha"]]
+    assert by_name["pull_request_commits"].source_defined_primary_key == [["repository"], ["pull_number"], ["sha"]]
     assert by_name["team_members"].source_defined_primary_key == [["id"], ["team_slug"]]
     assert by_name["team_memberships"].source_defined_primary_key == [["url"]]
     assert by_name["issue_timeline_events"].source_defined_primary_key == [["repository"], ["issue_number"]]
@@ -812,3 +812,24 @@ def test_issue_comment_reactions_states_without_parent_state_reread_every_commen
     final = states[-1].stream.stream_state.__dict__
     assert final["parent_state"]["comments"]
     assert "states" not in final or final.get("use_global_cursor")
+
+
+def test_pull_request_commits_keep_a_commit_shared_by_two_pull_requests(rate_limit_mock_response, requests_mock):
+    """A commit contained in two pull requests is two rows: the primary key includes the pull
+    request, so deduplication does not keep only one of them."""
+    config = _config(_REPO)
+    _mock_repository_resolution(requests_mock, _REPO)
+    requests_mock.get(
+        f"{_API}/repos/{_REPO}/pulls",
+        json=[_record(id=2, number=2, updated_at=_LATER, head={}, base={}), _record(id=1, number=1, updated_at=_AFTER_START, head={}, base={})],
+    )
+    requests_mock.get(f"{_API}/repos/{_REPO}/pulls/1/commits", json=[{"sha": "shared"}])
+    requests_mock.get(f"{_API}/repos/{_REPO}/pulls/2/commits", json=[{"sha": "shared"}])
+    source = make_source(config=_config(_REPO), catalog=None, state=None)
+    stream = next(s for s in source.discover(logging.getLogger("airbyte"), _config(_REPO)).streams if s.name == "pull_request_commits")
+
+    records, _, _, error = _read(config, "pull_request_commits")
+
+    assert error is None
+    keys = {tuple(record[field[0]] for field in stream.source_defined_primary_key) for record in records}
+    assert keys == {(_REPO, 1, "shared"), (_REPO, 2, "shared")}

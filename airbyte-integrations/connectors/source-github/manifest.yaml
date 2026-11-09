@@ -7753,7 +7753,8 @@ definitions:
     # API docs: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#list-commits-on-a-pull-request
     type: DeclarativeStream
     name: pull_request_commits
-    primary_key: "sha"
+    # A commit belongs to every pull request that contains it; keying on sha alone collapses them.
+    primary_key: ["repository", "pull_number", "sha"]
     retriever:
       type: SimpleRetriever
       requester:
