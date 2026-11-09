@@ -8,6 +8,7 @@ from airbyte_cdk.test.catalog_builder import CatalogBuilder
 from airbyte_cdk.test.entrypoint_wrapper import read
 from airbyte_cdk.test.mock_http import HttpMocker, HttpRequest, HttpResponse
 from airbyte_cdk.test.mock_http.response_builder import find_template
+from freezegun import freeze_time
 
 from ..utils import make_source
 from .config import ConfigBuilder
@@ -64,15 +65,18 @@ class CommentsTest(TestCase):
         """Stops and resets HttpMocker instance."""
         self.r_mock.__exit__(None, None, None)
 
+    @freeze_time("2023-06-01T00:00:00Z")
     def test_read_transforms_reaction_fields(self):
         """Ensure that +1 and -1 reaction fields are transformed to plus_one and minus_one"""
-        self.r_mock.get(
-            HttpRequest(
-                url=f"https://api.github.com/repos/{_CONFIG.get('repositories')[0]}/issues/comments",
-                query_params={"per_page": 10, "since": "2020-05-01T00:00:00Z"},
-            ),
-            HttpResponse(json.dumps(find_template("comments", __file__)), 200),
-        )
+        # One request per yearly window; the template's comment (updated 2023-01-01) is in the 2022 one.
+        for year in (2020, 2021, 2022):
+            self.r_mock.get(
+                HttpRequest(
+                    url=f"https://api.github.com/repos/{_CONFIG.get('repositories')[0]}/issues/comments",
+                    query_params={"per_page": 10, "since": f"{year}-05-01T00:00:00Z", "sort": "updated", "direction": "asc"},
+                ),
+                HttpResponse(json.dumps(find_template("comments", __file__) if year == 2022 else []), 200),
+            )
 
         source = make_source(config=_CONFIG)
         actual_messages = read(source, config=_CONFIG, catalog=_create_catalog())
