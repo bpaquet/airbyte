@@ -12,6 +12,7 @@ the legacy `GitHubGraphQLErrorHandler` now actually reaches GitHub.
 
 import json
 import logging
+import time
 
 import pytest
 
@@ -168,9 +169,10 @@ def _release_node(node_id="RE_1", database_id=11, tag="v1.0.0", created_at="2022
         "assets": {
             # `RA_kwDOAbcDEf4AAAAB` decodes to a msgpack array whose last 4 bytes are the
             # asset's numeric database ID.
-            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip", "uploader": {"id": 7}}],
+            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip"}],
             "pageInfo": {"hasNextPage": False},
         },
+        "asset_uploaders": {"nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "uploader": {"__typename": "User", "id": 7}}]},
         "reaction_groups": [
             {"content": "THUMBS_UP", "reactors": {"totalCount": 3}},
             {"content": "HEART", "reactors": {"totalCount": 1}},
@@ -221,10 +223,11 @@ def test_releases_record_keeps_the_rest_compatible_shape(rate_limit_mock_respons
         "eyes": 0,
         "total_count": 4,
     }
-    # Assets are unwrapped, the uploader is flattened, and the numeric id is recovered from
-    # the node id because GraphQL's ReleaseAsset has no databaseId.
+    # Assets are unwrapped, the uploader is joined from `asset_uploaders`, and the numeric id is
+    # recovered from the node id because GraphQL's ReleaseAsset has no databaseId.
     assert len(record["assets"]) == 1
     assert record["assets"][0]["uploader_id"] == 7
+    assert "asset_uploaders" not in record
     assert record["assets"][0]["id"] == 1
     # GraphQL returns none of these; they are synthesized to match the old REST payload.
     assert record["url"] == f"https://api.github.com/repos/{REPOSITORY}/releases/11"
@@ -454,6 +457,43 @@ def test_releases_warns_when_a_release_has_more_than_100_assets(rate_limit_mock_
     assert any(">100 assets" in message for message in caplog.messages)
 
 
+def _unresolved_uploader_page(errors):
+    node = _release_node()
+    node["asset_uploaders"] = {"nodes": [None]}
+    internal = {"type": "INTERNAL", "message": "Something went wrong while executing your query."}
+    return {**_repository_envelope("releases", [node]), "errors": [internal] * errors}
+
+
+def test_releases_keeps_a_page_whose_only_errors_are_unresolvable_asset_uploaders(rate_limit_mock_response, requests_mock):
+    """`ReleaseAsset.uploadedBy` is non-null `User!`. For an asset uploaded by a GitHub App or by
+    a deleted account GitHub nulls that `asset_uploaders` node and adds one INTERNAL error, at
+    every page size, so retrying or reducing the page would fail the stream on every sync."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_unresolved_uploader_page(errors=1))
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 1
+    assert records[0]["assets"][0]["uploader_id"] is None
+    assert records[0]["assets"][0]["name"] == "asset.zip"
+
+
+def test_releases_still_reduces_the_page_size_when_internal_errors_outnumber_unresolved_uploaders(rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(
+        GRAPHQL_URL,
+        [{"json": _unresolved_uploader_page(errors=2)}, {"json": _repository_envelope("releases", [_release_node()])}],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    first_sizes = [json.loads(request.body)["variables"]["first"] for request in _graphql_requests(requests_mock)]
+    assert first_sizes == [10, 5]
+    assert records[0]["assets"][0]["uploader_id"] == 7
+
+
 def test_releases_without_reaction_groups_reports_null_reactions(rate_limit_mock_response, requests_mock):
     """`reaction_groups: null` meant "unknown", not "zero of everything" -- the legacy
     transformation returned None for it and the schema allows null."""
@@ -521,6 +561,142 @@ def test_both_gateway_statuses_trigger_reduction(status_code, timeout_body, rate
     assert _variables(_graphql_requests(requests_mock)[1])["first"] == 5
 
 
+_INTERNAL_TIMEOUT_BODY = {
+    "data": None,
+    "errors": [
+        {
+            "type": "INTERNAL",
+            "message": "Something went wrong while executing your query on 2026-10-14T09:50:22Z. "
+            "Please include `7E88:3DA28F:D42559:1361494:6ACF505D` when reporting this issue.",
+        }
+    ],
+}
+
+
+_RESOURCE_LIMITS_BODY = {
+    "errors": [
+        {
+            "type": "RESOURCE_LIMITS_EXCEEDED",
+            "path": ["repository", "pullRequests", "nodes", 1, "comments"],
+            "message": "Resource limits for this query exceeded.",
+        }
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [pytest.param(_INTERNAL_TIMEOUT_BODY, id="internal"), pytest.param(_RESOURCE_LIMITS_BODY, id="resource_limits_exceeded")],
+)
+def test_internal_error_on_200_refetches_the_same_page_with_a_halved_page_size(body, rate_limit_mock_response, requests_mock):
+    """GitHub reports the same query deadline as a 502/504 or as a 200 carrying an INTERNAL
+    error, and a page too costly to compute as RESOURCE_LIMITS_EXCEEDED. Retrying either at the
+    same size failed the same way, behind a backoff that waits for the rate-limit reset."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    requests = _graphql_requests(requests_mock)
+    assert [_variables(request)["first"] for request in requests] == [10, 5]
+    assert "after" not in _variables(requests[1])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, id="other_error_type"),
+        pytest.param({"errors": [{"message": "Something went wrong while executing your query."}]}, id="untyped_error"),
+        pytest.param({"message": "Something went wrong"}, id="message_shape"),
+    ],
+)
+def test_other_body_errors_on_200_do_not_reduce_the_page_size(body, rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    _read(_config(), "releases")
+
+    assert {_variables(request)["first"] for request in _graphql_requests(requests_mock)} == {10}
+
+
+def test_other_body_errors_on_200_do_not_wait_for_the_rate_limit_reset(rate_limit_mock_response, requests_mock, monkeypatch):
+    """GitHub sends `X-RateLimit-Reset` on a 200 carrying errors too; waiting until it held one
+    page for close to an hour per retry while the GraphQL budget was fine."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param({"type": "RATE_LIMITED", "message": "API rate limit exceeded"}, id="rate_limited"),
+        pytest.param(
+            {"type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded for installation ID 1."},
+            id="already_over_the_limit",
+        ),
+    ],
+)
+def test_graphql_rate_limit_still_waits_for_the_reset(error, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Both are rate limits. RATE_LIMIT was retried as a generic error, which ran out of
+    attempts in five minutes and failed the stream in production."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(time.time()) + 600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [error]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, read_error = _read(_config(), "releases")
+
+    assert read_error is None
+    assert max(sleeps) > 500
+
+
+@pytest.mark.parametrize("stream_name", ["releases", "reviews"])
+def test_a_response_cut_off_in_transit_is_retried_quickly(stream_name, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Seen in production on `reviews`: a 200 whose body stopped mid-string was accepted as a
+    success and the stream failed reading it."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"text": '{"data": {"repository": {"name": "airby', "headers": headers},
+            {"json": _repository_envelope("releases", [])},
+        ],
+    )
+
+    _, error = _read(_config(), stream_name)
+
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 2
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
 def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, requests_mock):
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
@@ -539,9 +715,9 @@ def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, req
     assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 2]
 
 
-def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_response, requests_mock):
-    """`reset_policy: NEVER`. Restoring the configured size after a good page would re-trigger
-    the timeout on every subsequent page, which is what the legacy handler did."""
+def test_page_size_is_restored_after_a_successful_page(rate_limit_mock_response, requests_mock):
+    """`reset_policy: AFTER_SUCCESSFUL_PAGE`. GitHub rejects scattered pages, so keeping the
+    reduced size would read the rest of a long partition at the reduced size."""
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
         GRAPHQL_URL,
@@ -556,7 +732,7 @@ def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_respon
 
     assert error is None
     assert len(records) == 2
-    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 5]
+    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 10]
 
 
 def test_persistent_gateway_timeout_fails_the_stream_instead_of_looping(page_size_reduction_waits, rate_limit_mock_response, requests_mock):
@@ -774,6 +950,65 @@ def test_pull_request_stats_leaves_merged_by_null_when_not_merged(rate_limit_moc
     assert error is None
     assert records[0]["merged_by"] is None
     assert records[0]["review_comments"] == 0
+
+
+def _pull_request_stats_node(number=5, merge_state_status="CLEAN"):
+    return {
+        "node_id": f"PR_{number}",
+        "id": 20 + number,
+        "number": number,
+        "updated_at": "2022-06-08T00:00:00Z",
+        "merge_state_status": merge_state_status,
+        "comments": {"totalCount": 0},
+        "commits": {"totalCount": 1},
+        "review_comments": {"totalCount": 0, "nodes": []},
+        "merged_by": None,
+    }
+
+
+def _merge_state_status_times_out(request, context):
+    """GitHub's gateway answer when it cannot compute `mergeStateStatus` for a huge PR."""
+    if _variables(request).get("omitMergeStateStatus"):
+        node = _pull_request_stats_node()
+        node.pop("merge_state_status")
+        return _repository_envelope("pullRequests", [node])
+    context.status_code = 504
+    return {"message": "Gateway Timeout"}
+
+
+def test_pull_request_stats_skips_merge_state_status_for_a_pull_request_github_cannot_compute_it_for(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    """Seen on a 10,000-commit PR: `mergeStateStatus` times out at every page size, which failed
+    the repository on every sync."""
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_merge_state_status_times_out)
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert [record["number"] for record in records] == [5]
+    assert records[0].get("merge_state_status") is None
+    sent = [(_variables(request)["first"], _variables(request).get("omitMergeStateStatus")) for request in _graphql_requests(requests_mock)]
+    assert sent == [(10, None), (5, None), (2, None), (1, None), (1, None), (1, True)]
+
+
+def test_pull_request_stats_keeps_merge_state_status_when_the_single_pull_request_retry_succeeds(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    timeout = {"status_code": 504, "json": {"message": "Gateway Timeout"}}
+    requests_mock.post(
+        GRAPHQL_URL, [timeout, timeout, timeout, timeout, {"json": _repository_envelope("pullRequests", [_pull_request_stats_node()])}]
+    )
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert records[0]["merge_state_status"] == "CLEAN"
+    assert not any(_variables(request).get("omitMergeStateStatus") for request in _graphql_requests(requests_mock))
 
 
 # --- Shared behavior ------------------------------------------------------------------------
