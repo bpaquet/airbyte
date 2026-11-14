@@ -17,6 +17,7 @@ import struct
 import threading
 import time
 from dataclasses import InitVar, dataclass
+from datetime import datetime, timedelta
 from itertools import groupby
 from os import getenv
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
@@ -497,21 +498,19 @@ class NestedGraphQLPaginationStrategy(PaginationStrategy):
             pending.append([node.get("number"), child["pageInfo"]["endCursor"]])
 
 
-# Depth-first order for the four-level reaction traversal: the deepest pending connection is
-# always drilled into first, so a comment's reactions are finished before the next pull
-# request is opened. Ported from `graphql.CursorStorage`, which built the same ordering out of
-# a heap keyed on this list reversed.
+# Depth-first order for the reaction traversal: the deepest pending connection is always drilled
+# into first, so a comment's reactions are finished before the next review is opened. Ported
+# from `graphql.CursorStorage`, which built the same ordering out of a heap keyed on this list
+# reversed.
 _REACTION_TRAVERSAL_PRIORITY = {
     "Reaction": 0,
     "PullRequestReviewComment": 1,
     "PullRequestReview": 2,
-    "PullRequest": 3,
 }
 
-# Which child connection each queued object type needs paginated, and which document roots at
-# it. `PullRequest` is the repository-level listing; the rest root at `node(id:)`.
+# Which child connection each queued object type needs paginated; every document roots at
+# `node(id:)`.
 _REACTION_CONNECTION_OF = {
-    "PullRequest": "pullRequests",
     "PullRequestReview": "reviews",
     "PullRequestReviewComment": "comments",
     "Reaction": "reactions",
@@ -520,13 +519,12 @@ _REACTION_CONNECTION_OF = {
 
 @dataclass
 class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
-    """Four-level depth-first traversal for `pull_request_comment_reactions`.
+    """Depth-first traversal for `pull_request_comment_reactions`.
 
-    `repository.pullRequests -> reviews -> comments -> reactions`. Every level can have more
-    pages than the query asked for, and none of them can be paginated in place, so each
-    overflowing connection is queued and later re-rooted with its own document:
+    Each partition is one pull request: `pullRequest -> reviews -> comments -> reactions`. Every
+    level can have more pages than the query asked for, and none of them can be paginated in
+    place, so each overflowing connection is queued and later re-rooted with its own document:
 
-    - `PullRequest`      -> the repository listing, paginated by `pullRequests`
     - `PullRequestReview`-> `node(id: <pull request>)`, paginated by `reviews`
     - `PullRequestReviewComment` -> `node(id: <review>)`, paginated by `comments`
     - `Reaction`         -> `node(id: <comment>)`, paginated by `reactions`
@@ -536,8 +534,7 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
 
     Like `NestedGraphQLPaginationStrategy`, the queue lives in the page token rather than on
     this object, because one strategy instance is shared by every partition of the stream and
-    the partitions are read concurrently. The legacy `self.cursor_storage` was a single heap
-    shared across repositories.
+    the partitions are read concurrently.
 
     One legacy behavior is deliberately not carried over: the legacy `request_body_json` used to send
     `first = min(page_size, total_count)` to avoid paying for pages larger than what remained.
@@ -555,7 +552,6 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
 
     # $parameters key holding the document that re-roots at each object type.
     DOCUMENT_PARAMETERS = {
-        "PullRequest": "root_repository_document",
         "PullRequestReview": "root_pull_request_document",
         "PullRequestReviewComment": "root_review_document",
         "Reaction": "root_comment_document",
@@ -591,12 +587,6 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
 
         data = response.json().get("data") or {}
 
-        repository = data.get("repository")
-        if repository:
-            sequence = self._queue(repository, "PullRequest", pending, sequence)
-            for pull_request in self._nodes(repository, "pullRequests"):
-                sequence = self._walk_pull_request(pull_request, pending, sequence)
-
         node = data.get("node")
         if node:
             typename = node.get("__typename")
@@ -613,9 +603,7 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
         # Deepest first, and first-queued first within a depth -- the ordering the heap gave.
         pending.sort(key=lambda item: (item[0], item[1]))
         _, _, typename, cursor, node_id = pending.pop(0)
-        document = self.documents[typename]  # type: ignore[index]
-        if node_id is not None:
-            document = document.replace(self.NODE_PLACEHOLDER, str(node_id))
+        document = self.documents[typename].replace(self.NODE_PLACEHOLDER, str(node_id))  # type: ignore[index]
         return {"document": document, "after": cursor, "typename": typename, "pending": pending, "sequence": sequence}
 
     def _walk_pull_request(self, pull_request: Mapping[str, Any], pending: list, sequence: int) -> int:
@@ -636,14 +624,58 @@ class DeepNestedGraphQLPaginationStrategy(PaginationStrategy):
         page_info = connection.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
             return sequence
-        # `PullRequest` re-roots at the repository listing, which needs no node id.
-        node_id = None if typename == "PullRequest" else node.get("node_id")
-        pending.append([_REACTION_TRAVERSAL_PRIORITY[typename], sequence, typename, page_info.get("endCursor"), node_id])
+        pending.append([_REACTION_TRAVERSAL_PRIORITY[typename], sequence, typename, page_info.get("endCursor"), node.get("node_id")])
         return sequence + 1
 
     @staticmethod
     def _nodes(node: Mapping[str, Any], connection: str) -> Iterable[Mapping[str, Any]]:
         return ((node.get(connection) or {}).get("nodes")) or []
+
+
+@dataclass
+class PullRequestCommentReactionsStateMigration(StateMigration):
+    """Seed the `pull_requests` parent state from the per-repository state of the full-scan version.
+
+    That version re-read every pull request on each sync, so its state proves every pull request
+    was scanned up to about the newest reaction it saw. Starting the parent there, minus a margin
+    for the length of a scan, avoids one query per pull request ever opened on the first sync.
+    Without any reaction seen, the parent reads from `start_date`.
+    """
+
+    config: Config
+    parameters: Mapping[str, Any]
+
+    MARGIN = timedelta(days=2)
+    FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+    def should_migrate(self, stream_state: Mapping[str, Any]) -> bool:
+        return bool(stream_state) and "pull_requests" not in (stream_state.get("parent_state") or {})
+
+    def migrate(self, stream_state: Mapping[str, Any]) -> Mapping[str, Any]:
+        if "states" in stream_state:
+            cursors = {
+                (entry.get("partition") or {}).get("repository"): (entry.get("cursor") or {}).get("created_at")
+                for entry in stream_state.get("states") or []
+            }
+        else:
+            cursors = {repository: value.get("created_at") for repository, value in stream_state.items() if isinstance(value, Mapping)}
+        repositories = [repository for repository in cursors if repository]
+        values = [datetime.strptime(value, self.FORMAT) for value in cursors.values() if value]
+        newest = max(values, default=None)
+        if not repositories or newest is None or newest.year <= 1970:
+            return {"use_global_cursor": True}
+        seed = (newest - self.MARGIN).strftime(self.FORMAT)
+        return {
+            "use_global_cursor": True,
+            "state": {"created_at": newest.strftime(self.FORMAT)},
+            "parent_state": {
+                "pull_requests": {
+                    "use_global_cursor": False,
+                    "state": {"updated_at": seed},
+                    "states": [{"partition": {"repository": repository}, "cursor": {"updated_at": seed}} for repository in repositories],
+                }
+            },
+        }
 
 
 @dataclass

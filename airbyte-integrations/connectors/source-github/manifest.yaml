@@ -19382,52 +19382,8 @@ definitions:
     name: pull_request_comment_reactions
     primary_key: "id"
     $parameters:
-      # One document per object type the traversal can re-root at. The repository listing is
-      # also the entry point, so `request_body` references it directly.
-      root_repository_document: |
-        query PullRequestCommentReactions($owner: String!, $name: String!, $first: Int!, $after: String) {
-          repository(owner: $owner, name: $name) {
-            name
-            owner { login }
-            pullRequests(first: $first, after: $after) {
-              pageInfo { hasNextPage endCursor }
-              nodes {
-                node_id: id
-                reviews(first: 5) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes {
-                    node_id: id
-                    id: databaseId
-                    comments(first: 2) {
-                      pageInfo { hasNextPage endCursor }
-                      nodes {
-                        node_id: id
-                        id: databaseId
-                        reactions(first: 2) {
-                          pageInfo { hasNextPage endCursor }
-                          nodes {
-                          node_id: id
-                          id: databaseId
-                          content
-                          created_at: createdAt
-                          user {
-                          node_id: id
-                          id: databaseId
-                          login
-                          avatar_url: avatarUrl
-                          html_url: url
-                          site_admin: isSiteAdmin
-                          }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+      # One document per object type the traversal can re-root at. Each partition is one pull
+      # request, so the pull request document is also the entry point.
       root_pull_request_document: |
         query ReviewsOfPullRequest($first: Int!, $after: String) {
           node(id: "__NODE_ID__") {
@@ -19540,41 +19496,21 @@ definitions:
         request_body:
           type: RequestBodyJsonObject
           value:
-            query: "{{ next_page_token['next_page_token']['document'] if next_page_token else parameters['root_repository_document'] }}"
+            query: "{{ next_page_token['next_page_token']['document'] if next_page_token else parameters['root_pull_request_document'].replace('__NODE_ID__', stream_partition.pull_request_node_id) }}"
             variables:
-              # `owner`/`name` are only declared by the repository listing document; the
-              # drill-down documents root at `node(id:)` and declare neither, so they are
-              # omitted whenever the token carries a drill-down document. A GraphQL document
-              # rejects a variable it does not declare, which is why this cannot just always
-              # send all of them. The test is which document the token carries, not the mere
-              # presence of a token: the listing paginates too (`typename: PullRequest` re-roots
-              # at the listing, with no node id), and dropping the variables on its second page
-              # made GitHub answer `data: null`, so the stream stopped after the first page and
-              # only the newest `graphql_large_stream_page_size` pull requests were ever scanned.
-              owner: "{{ None if next_page_token and next_page_token['next_page_token']['typename'] != 'PullRequest' else stream_partition.repository.split('/')[0] }}"
-              name: "{{ None if next_page_token and next_page_token['next_page_token']['typename'] != 'PullRequest' else stream_partition.repository.split('/')[1] }}"
               after: "{{ next_page_token['next_page_token']['after'] if next_page_token else None }}"
       record_selector:
         type: RecordSelector
         extractor:
-          # The traversal re-roots at four object types, so a response holds comments under one of
-          # four paths: the repository listing, or a `node` that is a pull request, a review or the
-          # comment itself. The documents select only the connections of their own root type, so
-          # the paths of the other roots are absent and the union yields the comments' reactions
-          # from whichever root came back. Each comment is expanded into its reactions, copying the
+          # The traversal re-roots at three object types, so a response holds comments under one of
+          # three paths: a `node` that is a pull request, a review or the comment itself. The
+          # documents select only the connections of their own root type, so the paths of the
+          # other roots are absent and the union yields the comments' reactions from whichever
+          # root came back. Each comment is expanded into its reactions, copying the
           # comment's `id` onto every reaction as `comment_id`.
           type: CombinedExtractor
           mode: union
           extractors:
-            - type: DpathExtractor
-              field_path: ["data", "repository", "pullRequests", "nodes", "*", "reviews", "nodes", "*", "comments", "nodes", "*"]
-              record_expander:
-                type: RecordExpander
-                expand_records_from_field: ["reactions", "nodes"]
-                parent_fields:
-                  - type: ParentFieldPath
-                    parent_path: ["id"]
-                    record_path: ["comment_id"]
             - type: DpathExtractor
               field_path: ["data", "node", "reviews", "nodes", "*", "comments", "nodes", "*"]
               record_expander:
@@ -19614,12 +19550,22 @@ definitions:
           # Not a `large_stream` in the legacy code, so it keeps constants.DEFAULT_PAGE_SIZE.
           page_size: 100
       partition_router:
-        $ref: "#/definitions/repository_partition_router"
+        type: SubstreamPartitionRouter
+        parent_stream_configs:
+          - type: ParentStreamConfig
+            stream:
+              $ref: "#/definitions/pull_requests_stream"
+            parent_key: "node_id"
+            partition_field: "pull_request_node_id"
+            # A new review comment bumps its pull request's updated_at; a reaction does not.
+            incremental_dependency: true
+            extra_fields:
+              - ["repository"]
     transformations:
       - type: AddFields
         fields:
           - path: ["repository"]
-            value: "{{ stream_partition.repository }}"
+            value: "{{ stream_slice.extra_fields['repository'] }}"
       - type: AddFields
         # The legacy record carried `user.type`, and `user` is not a union in these documents.
         condition: "{{ record.get('user') }}"
@@ -19627,18 +19573,12 @@ definitions:
           - path: ["user", "type"]
             value: "User"
     incremental_sync:
-      type: DatetimeBasedCursor
+      $ref: "#/definitions/semi_incremental_cursor_base"
       cursor_field: "created_at"
-      cursor_datetime_formats:
-        - "%Y-%m-%dT%H:%M:%SZ"
-      datetime_format: "%Y-%m-%dT%H:%M:%SZ"
-      start_datetime:
-        type: MinMaxDatetime
-        datetime: "{{ config.get('start_date') or '1970-01-01T00:00:00Z' }}"
-        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
-      is_client_side_incremental: true
+      global_substream_cursor: true
     state_migrations:
-      - type: LegacyToPerPartitionStateMigration
+      - type: CustomStateMigration
+        class_name: source_declarative_manifest.components.PullRequestCommentReactionsStateMigration
     schema_loader:
       type: InlineSchemaLoader
       schema:

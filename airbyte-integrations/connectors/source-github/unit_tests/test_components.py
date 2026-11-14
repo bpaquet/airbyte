@@ -219,7 +219,6 @@ def _deep_strategy():
         config={},
         parameters={},
         documents={
-            "PullRequest": "ROOT_REPOSITORY",
             "PullRequestReview": "ROOT_PULL_REQUEST __NODE_ID__",
             "PullRequestReviewComment": "ROOT_REVIEW __NODE_ID__",
             "Reaction": "ROOT_COMMENT __NODE_ID__",
@@ -244,49 +243,38 @@ def _review(node_id, database_id, comments, comments_next=False, cursor=None):
     }
 
 
-def _deep_listing(pull_requests, list_next=False, list_cursor=None):
+def _deep_pull_request(node_id, reviews, reviews_next=False, cursor=None):
     return {
         "data": {
-            "repository": {
-                "name": "airbyte",
-                "owner": {"login": "airbytehq"},
-                "pullRequests": {"pageInfo": _page_info(list_next, list_cursor), "nodes": pull_requests},
+            "node": {
+                "__typename": "PullRequest",
+                "node_id": node_id,
+                "repository": {"name": "airbyte", "owner": {"login": "airbytehq"}},
+                "reviews": {"pageInfo": _page_info(reviews_next, cursor), "nodes": reviews},
             }
         }
     }
 
 
-def _deep_pull_request(node_id, reviews, reviews_next=False, cursor=None):
-    return {"node_id": node_id, "reviews": {"pageInfo": _page_info(reviews_next, cursor), "nodes": reviews}}
+def _overflowing_pull_request():
+    return _deep_pull_request(
+        "PR_1",
+        [_review("RV_1", 1, [_comment("C_1", 1, reactions_next=True, cursor="REACT_CUR")], comments_next=True, cursor="COMMENT_CUR")],
+        reviews_next=True,
+        cursor="REVIEW_CUR",
+    )
 
 
 def test_deep_strategy_stops_when_nothing_overflows():
-    payload = _deep_listing([_deep_pull_request("PR_1", [_review("RV_1", 1, [_comment("C_1", 1)])])])
+    payload = _deep_pull_request("PR_1", [_review("RV_1", 1, [_comment("C_1", 1)])])
 
     assert _deep_strategy().next_page_token(_response(payload), 1, None, None) is None
 
 
 def test_deep_strategy_drills_deepest_first():
-    """A comment with more reactions must be drained before the pull request listing advances,
-    which is what makes the traversal depth-first."""
-    payload = _deep_listing(
-        [
-            _deep_pull_request(
-                "PR_1",
-                [
-                    _review(
-                        "RV_1", 1, [_comment("C_1", 1, reactions_next=True, cursor="REACT_CUR")], comments_next=True, cursor="COMMENT_CUR"
-                    )
-                ],
-                reviews_next=True,
-                cursor="REVIEW_CUR",
-            )
-        ],
-        list_next=True,
-        list_cursor="LIST_CUR",
-    )
-
-    token = _deep_strategy().next_page_token(_response(payload), 1, None, None)
+    """A comment with more reactions must be drained before the pull request's next reviews are
+    read, which is what makes the traversal depth-first."""
+    token = _deep_strategy().next_page_token(_response(_overflowing_pull_request()), 1, None, None)
 
     assert token["typename"] == "Reaction"
     assert token["document"] == "ROOT_COMMENT C_1"
@@ -295,27 +283,10 @@ def test_deep_strategy_drills_deepest_first():
     assert [item[2] for item in sorted(token["pending"], key=lambda i: (i[0], i[1]))] == [
         "PullRequestReviewComment",
         "PullRequestReview",
-        "PullRequest",
     ]
 
 
 def test_deep_strategy_walks_the_whole_queue_in_depth_order():
-    payload = _deep_listing(
-        [
-            _deep_pull_request(
-                "PR_1",
-                [
-                    _review(
-                        "RV_1", 1, [_comment("C_1", 1, reactions_next=True, cursor="REACT_CUR")], comments_next=True, cursor="COMMENT_CUR"
-                    )
-                ],
-                reviews_next=True,
-                cursor="REVIEW_CUR",
-            )
-        ],
-        list_next=True,
-        list_cursor="LIST_CUR",
-    )
     strategy = _deep_strategy()
     empty_node = {
         "data": {
@@ -330,7 +301,7 @@ def test_deep_strategy_walks_the_whole_queue_in_depth_order():
     }
 
     order = []
-    token = strategy.next_page_token(_response(payload), 1, None, None)
+    token = strategy.next_page_token(_response(_overflowing_pull_request()), 1, None, None)
     while token:
         order.append((token["typename"], token["document"], token["after"]))
         token = strategy.next_page_token(_response(empty_node), 0, None, token)
@@ -340,19 +311,7 @@ def test_deep_strategy_walks_the_whole_queue_in_depth_order():
         ("Reaction", "ROOT_COMMENT C_1", "REACT_CUR"),
         ("PullRequestReviewComment", "ROOT_REVIEW RV_1", "COMMENT_CUR"),
         ("PullRequestReview", "ROOT_PULL_REQUEST PR_1", "REVIEW_CUR"),
-        ("PullRequest", "ROOT_REPOSITORY", "LIST_CUR"),
     ]
-
-
-def test_deep_strategy_re_roots_at_the_repository_listing_without_a_node_id():
-    payload = _deep_listing([], list_next=True, list_cursor="LIST_CUR")
-
-    token = _deep_strategy().next_page_token(_response(payload), 0, None, None)
-
-    assert token["typename"] == "PullRequest"
-    # No placeholder substitution: the listing is addressed by owner/name, not a node id.
-    assert token["document"] == "ROOT_REPOSITORY"
-    assert token["after"] == "LIST_CUR"
 
 
 def test_deep_strategy_queues_from_a_drilldown_response():
@@ -378,8 +337,8 @@ def test_deep_strategy_queues_from_a_drilldown_response():
 
 def test_deep_strategy_keeps_no_state_between_partitions():
     strategy = _deep_strategy()
-    overflowing = _deep_listing([], list_next=True, list_cursor="A_CUR")
-    quiet = _deep_listing([_deep_pull_request("PR_9", [])])
+    overflowing = _deep_pull_request("PR_1", [], reviews_next=True, cursor="A_CUR")
+    quiet = _deep_pull_request("PR_9", [])
 
     token_a = strategy.next_page_token(_response(overflowing), 0, None, None)
     token_b = strategy.next_page_token(_response(quiet), 0, None, None)
@@ -393,7 +352,7 @@ def test_deep_strategy_requires_a_document_for_every_object_type():
         DeepNestedGraphQLPaginationStrategy(
             config={},
             parameters={},
-            documents={"PullRequest": "A", "PullRequestReview": "B", "PullRequestReviewComment": "C"},
+            documents={"PullRequestReview": "B", "PullRequestReviewComment": "C"},
         )
 
 
@@ -401,7 +360,6 @@ def test_deep_strategy_reads_its_documents_from_parameters():
     strategy = DeepNestedGraphQLPaginationStrategy(
         config={},
         parameters={
-            "root_repository_document": "ROOT_REPOSITORY",
             "root_pull_request_document": "ROOT_PULL_REQUEST",
             "root_review_document": "ROOT_REVIEW",
             "root_comment_document": "ROOT_COMMENT",
