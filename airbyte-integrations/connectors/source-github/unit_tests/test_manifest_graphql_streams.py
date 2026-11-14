@@ -12,6 +12,9 @@ the legacy `GitHubGraphQLErrorHandler` now actually reaches GitHub.
 
 import json
 import logging
+import os
+import shutil
+import time
 
 import pytest
 
@@ -168,9 +171,10 @@ def _release_node(node_id="RE_1", database_id=11, tag="v1.0.0", created_at="2022
         "assets": {
             # `RA_kwDOAbcDEf4AAAAB` decodes to a msgpack array whose last 4 bytes are the
             # asset's numeric database ID.
-            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip", "uploader": {"id": 7}}],
+            "nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "name": "asset.zip"}],
             "pageInfo": {"hasNextPage": False},
         },
+        "asset_uploaders": {"nodes": [{"node_id": "RA_kwDOAbcDEf4AAAAB", "uploader": {"__typename": "User", "id": 7}}]},
         "reaction_groups": [
             {"content": "THUMBS_UP", "reactors": {"totalCount": 3}},
             {"content": "HEART", "reactors": {"totalCount": 1}},
@@ -221,10 +225,11 @@ def test_releases_record_keeps_the_rest_compatible_shape(rate_limit_mock_respons
         "eyes": 0,
         "total_count": 4,
     }
-    # Assets are unwrapped, the uploader is flattened, and the numeric id is recovered from
-    # the node id because GraphQL's ReleaseAsset has no databaseId.
+    # Assets are unwrapped, the uploader is joined from `asset_uploaders`, and the numeric id is
+    # recovered from the node id because GraphQL's ReleaseAsset has no databaseId.
     assert len(record["assets"]) == 1
     assert record["assets"][0]["uploader_id"] == 7
+    assert "asset_uploaders" not in record
     assert record["assets"][0]["id"] == 1
     # GraphQL returns none of these; they are synthesized to match the old REST payload.
     assert record["url"] == f"https://api.github.com/repos/{REPOSITORY}/releases/11"
@@ -454,6 +459,43 @@ def test_releases_warns_when_a_release_has_more_than_100_assets(rate_limit_mock_
     assert any(">100 assets" in message for message in caplog.messages)
 
 
+def _unresolved_uploader_page(errors):
+    node = _release_node()
+    node["asset_uploaders"] = {"nodes": [None]}
+    internal = {"type": "INTERNAL", "message": "Something went wrong while executing your query."}
+    return {**_repository_envelope("releases", [node]), "errors": [internal] * errors}
+
+
+def test_releases_keeps_a_page_whose_only_errors_are_unresolvable_asset_uploaders(rate_limit_mock_response, requests_mock):
+    """`ReleaseAsset.uploadedBy` is non-null `User!`. For an asset uploaded by a GitHub App or by
+    a deleted account GitHub nulls that `asset_uploaders` node and adds one INTERNAL error, at
+    every page size, so retrying or reducing the page would fail the stream on every sync."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_unresolved_uploader_page(errors=1))
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 1
+    assert records[0]["assets"][0]["uploader_id"] is None
+    assert records[0]["assets"][0]["name"] == "asset.zip"
+
+
+def test_releases_still_reduces_the_page_size_when_internal_errors_outnumber_unresolved_uploaders(rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(
+        GRAPHQL_URL,
+        [{"json": _unresolved_uploader_page(errors=2)}, {"json": _repository_envelope("releases", [_release_node()])}],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    first_sizes = [json.loads(request.body)["variables"]["first"] for request in _graphql_requests(requests_mock)]
+    assert first_sizes == [10, 5]
+    assert records[0]["assets"][0]["uploader_id"] == 7
+
+
 def test_releases_without_reaction_groups_reports_null_reactions(rate_limit_mock_response, requests_mock):
     """`reaction_groups: null` meant "unknown", not "zero of everything" -- the legacy
     transformation returned None for it and the schema allows null."""
@@ -521,6 +563,142 @@ def test_both_gateway_statuses_trigger_reduction(status_code, timeout_body, rate
     assert _variables(_graphql_requests(requests_mock)[1])["first"] == 5
 
 
+_INTERNAL_TIMEOUT_BODY = {
+    "data": None,
+    "errors": [
+        {
+            "type": "INTERNAL",
+            "message": "Something went wrong while executing your query on 2026-10-14T09:50:22Z. "
+            "Please include `7E88:3DA28F:D42559:1361494:6ACF505D` when reporting this issue.",
+        }
+    ],
+}
+
+
+_RESOURCE_LIMITS_BODY = {
+    "errors": [
+        {
+            "type": "RESOURCE_LIMITS_EXCEEDED",
+            "path": ["repository", "pullRequests", "nodes", 1, "comments"],
+            "message": "Resource limits for this query exceeded.",
+        }
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [pytest.param(_INTERNAL_TIMEOUT_BODY, id="internal"), pytest.param(_RESOURCE_LIMITS_BODY, id="resource_limits_exceeded")],
+)
+def test_internal_error_on_200_refetches_the_same_page_with_a_halved_page_size(body, rate_limit_mock_response, requests_mock):
+    """GitHub reports the same query deadline as a 502/504 or as a 200 carrying an INTERNAL
+    error, and a page too costly to compute as RESOURCE_LIMITS_EXCEEDED. Retrying either at the
+    same size failed the same way, behind a backoff that waits for the rate-limit reset."""
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    requests = _graphql_requests(requests_mock)
+    assert [_variables(request)["first"] for request in requests] == [10, 5]
+    assert "after" not in _variables(requests[1])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, id="other_error_type"),
+        pytest.param({"errors": [{"message": "Something went wrong while executing your query."}]}, id="untyped_error"),
+        pytest.param({"message": "Something went wrong"}, id="message_shape"),
+    ],
+)
+def test_other_body_errors_on_200_do_not_reduce_the_page_size(body, rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, [{"json": body}, {"json": _repository_envelope("releases", [_release_node()])}])
+
+    _read(_config(), "releases")
+
+    assert {_variables(request)["first"] for request in _graphql_requests(requests_mock)} == {10}
+
+
+def test_other_body_errors_on_200_do_not_wait_for_the_rate_limit_reset(rate_limit_mock_response, requests_mock, monkeypatch):
+    """GitHub sends `X-RateLimit-Reset` on a 200 carrying errors too; waiting until it held one
+    page for close to an hour per retry while the GraphQL budget was fine."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [{"type": "SOMETHING_ELSE", "message": "boom"}]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, error = _read(_config(), "releases")
+
+    assert error is None
+    assert len(records) == 1
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param({"type": "RATE_LIMITED", "message": "API rate limit exceeded"}, id="rate_limited"),
+        pytest.param(
+            {"type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded for installation ID 1."},
+            id="already_over_the_limit",
+        ),
+    ],
+)
+def test_graphql_rate_limit_still_waits_for_the_reset(error, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Both are rate limits. RATE_LIMIT was retried as a generic error, which ran out of
+    attempts in five minutes and failed the stream in production."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(time.time()) + 600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"json": {"errors": [error]}, "headers": headers},
+            {"json": _repository_envelope("releases", [_release_node()])},
+        ],
+    )
+
+    records, read_error = _read(_config(), "releases")
+
+    assert read_error is None
+    assert max(sleeps) > 500
+
+
+@pytest.mark.parametrize("stream_name", ["releases", "reviews"])
+def test_a_response_cut_off_in_transit_is_retried_quickly(stream_name, rate_limit_mock_response, requests_mock, monkeypatch):
+    """Seen in production on `reviews`: a 200 whose body stopped mid-string was accepted as a
+    success and the stream failed reading it."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    _mock_repository_resolution(requests_mock)
+    headers = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+    requests_mock.post(
+        GRAPHQL_URL,
+        [
+            {"text": '{"data": {"repository": {"name": "airby', "headers": headers},
+            {"json": _repository_envelope("releases", [])},
+        ],
+    )
+
+    _, error = _read(_config(), stream_name)
+
+    assert error is None
+    assert len(_graphql_requests(requests_mock)) == 2
+    assert [seconds for seconds in sleeps if seconds >= 1] == [11]
+
+
 def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, requests_mock):
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
@@ -539,9 +717,9 @@ def test_reduction_repeats_until_the_page_succeeds(rate_limit_mock_response, req
     assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 2]
 
 
-def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_response, requests_mock):
-    """`reset_policy: NEVER`. Restoring the configured size after a good page would re-trigger
-    the timeout on every subsequent page, which is what the legacy handler did."""
+def test_page_size_is_restored_after_a_successful_page(rate_limit_mock_response, requests_mock):
+    """`reset_policy: AFTER_SUCCESSFUL_PAGE`. GitHub rejects scattered pages, so keeping the
+    reduced size would read the rest of a long partition at the reduced size."""
     _mock_repository_resolution(requests_mock)
     requests_mock.post(
         GRAPHQL_URL,
@@ -556,7 +734,7 @@ def test_reduced_page_size_is_kept_for_the_following_page(rate_limit_mock_respon
 
     assert error is None
     assert len(records) == 2
-    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 5]
+    assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [10, 5, 10]
 
 
 def test_persistent_gateway_timeout_fails_the_stream_instead_of_looping(page_size_reduction_waits, rate_limit_mock_response, requests_mock):
@@ -774,6 +952,65 @@ def test_pull_request_stats_leaves_merged_by_null_when_not_merged(rate_limit_moc
     assert error is None
     assert records[0]["merged_by"] is None
     assert records[0]["review_comments"] == 0
+
+
+def _pull_request_stats_node(number=5, merge_state_status="CLEAN"):
+    return {
+        "node_id": f"PR_{number}",
+        "id": 20 + number,
+        "number": number,
+        "updated_at": "2022-06-08T00:00:00Z",
+        "merge_state_status": merge_state_status,
+        "comments": {"totalCount": 0},
+        "commits": {"totalCount": 1},
+        "review_comments": {"totalCount": 0, "nodes": []},
+        "merged_by": None,
+    }
+
+
+def _merge_state_status_times_out(request, context):
+    """GitHub's gateway answer when it cannot compute `mergeStateStatus` for a huge PR."""
+    if _variables(request).get("omitMergeStateStatus"):
+        node = _pull_request_stats_node()
+        node.pop("merge_state_status")
+        return _repository_envelope("pullRequests", [node])
+    context.status_code = 504
+    return {"message": "Gateway Timeout"}
+
+
+def test_pull_request_stats_skips_merge_state_status_for_a_pull_request_github_cannot_compute_it_for(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    """Seen on a 10,000-commit PR: `mergeStateStatus` times out at every page size, which failed
+    the repository on every sync."""
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    requests_mock.post(GRAPHQL_URL, json=_merge_state_status_times_out)
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert [record["number"] for record in records] == [5]
+    assert records[0].get("merge_state_status") is None
+    sent = [(_variables(request)["first"], _variables(request).get("omitMergeStateStatus")) for request in _graphql_requests(requests_mock)]
+    assert sent == [(10, None), (5, None), (2, None), (1, None), (1, None), (1, True)]
+
+
+def test_pull_request_stats_keeps_merge_state_status_when_the_single_pull_request_retry_succeeds(
+    rate_limit_mock_response, requests_mock, monkeypatch
+):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    _mock_repository_resolution(requests_mock)
+    timeout = {"status_code": 504, "json": {"message": "Gateway Timeout"}}
+    requests_mock.post(
+        GRAPHQL_URL, [timeout, timeout, timeout, timeout, {"json": _repository_envelope("pullRequests", [_pull_request_stats_node()])}]
+    )
+
+    records, error = _read(_config(), "pull_request_stats")
+
+    assert error is None
+    assert records[0]["merge_state_status"] == "CLEAN"
+    assert not any(_variables(request).get("omitMergeStateStatus") for request in _graphql_requests(requests_mock))
 
 
 # --- Shared behavior ------------------------------------------------------------------------
@@ -1066,7 +1303,7 @@ def test_issue_reactions_drills_into_an_issue_with_more_reactions(rate_limit_moc
     assert second["variables"]["after"] == "REACT_CUR"
 
 
-# --- PullRequestCommentReactions (four-level traversal) --------------------------------------
+# --- PullRequestCommentReactions (substream of pull_requests) ----------------------------------
 
 
 def _pr_comment(node_id, database_id, reactions, has_next=False, cursor=None):
@@ -1092,28 +1329,59 @@ def _pr_with_reviews(node_id, reviews, has_next=False, cursor=None):
     }
 
 
-def _deep_listing(pull_requests, has_next_page=False, end_cursor=None):
-    return {
-        "data": {
-            "repository": {
-                "name": REPOSITORY.split("/")[1],
-                "owner": {"login": REPOSITORY.split("/")[0]},
-                "pullRequests": {
-                    "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
-                    "totalCount": len(pull_requests),
-                    "nodes": pull_requests,
-                },
-            }
-        }
-    }
+def _deep_node(typename, node):
+    repository = {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}}
+    return {"data": {"node": {**node, "__typename": typename, "repository": repository}}}
 
 
-def test_pull_request_comment_reactions_reads_the_four_level_listing(rate_limit_mock_response, requests_mock):
-    _mock_repository_resolution(requests_mock)
-    payload = _deep_listing(
-        [_pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_1", 301)])])])]
+def _pr_root(node_id, reviews, has_next=False, cursor=None):
+    return _deep_node("PullRequest", _pr_with_reviews(node_id, reviews, has_next=has_next, cursor=cursor))
+
+
+def _pull_request(node_id, number, updated_at="2022-05-01T00:00:00Z"):
+    return {"id": number, "number": number, "node_id": node_id, "updated_at": updated_at, "head": {}, "base": {}}
+
+
+def _mock_pull_requests(requests_mock, *pull_requests):
+    """`pull_requests` answers newest-updated first, like `sort=updated&direction=desc`."""
+    ordered = sorted(pull_requests, key=lambda pull_request: pull_request["updated_at"], reverse=True)
+    requests_mock.get(f"https://api.github.com/repos/{REPOSITORY}/pulls", json=ordered)
+
+
+def _query_node_ids(requests_mock):
+    return [json.loads(request.body)["query"].split('node(id: "')[1].split('"')[0] for request in _graphql_requests(requests_mock)]
+
+
+def _incremental_read(config, stream_name, state=None):
+    catalog = ConfiguredAirbyteCatalog(
+        streams=[
+            ConfiguredAirbyteStream(
+                stream=AirbyteStream(name=stream_name, json_schema={}, supported_sync_modes=[SyncMode.incremental]),
+                sync_mode=SyncMode.incremental,
+                destination_sync_mode=DestinationSyncMode.append_dedup,
+            )
+        ]
     )
-    requests_mock.post(GRAPHQL_URL, json=payload)
+    state_messages = []
+    if state is not None:
+        state_messages = [
+            AirbyteStateMessage(
+                type=AirbyteStateType.STREAM,
+                stream=AirbyteStreamState(stream_descriptor=StreamDescriptor(name=stream_name), stream_state=AirbyteStateBlob(state)),
+            )
+        ]
+    # `pull_requests` is read through the HTTP cache, which would replay the previous sync's listing.
+    shutil.rmtree(os.environ["REQUEST_CACHE_PATH"], ignore_errors=True)
+    source = make_source(config=dict(config), catalog=catalog, state=state_messages)
+    messages = list(source.read(logging.getLogger("airbyte"), dict(config), catalog, state_messages))
+    states = [message.state.stream.stream_state.__dict__ for message in messages if message.type == Type.STATE]
+    return _records(messages), states[-1]
+
+
+def test_pull_request_comment_reactions_reads_each_pull_request_from_its_node(rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1))
+    requests_mock.post(GRAPHQL_URL, json=_pr_root("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_1", 301)])])]))
 
     records, error = _read(_config(), "pull_request_comment_reactions")
 
@@ -1123,72 +1391,38 @@ def test_pull_request_comment_reactions_reads_the_four_level_listing(rate_limit_
     assert records[0]["repository"] == REPOSITORY
     # The comment the reaction hangs off, by database id -- as the legacy record had it.
     assert records[0]["comment_id"] == 21
+    requests = _graphql_requests(requests_mock)
+    assert _query_node_ids(requests_mock) == ["PR_1"]
+    assert "__NODE_ID__" not in json.loads(requests[0].body)["query"]
+    assert _variables(requests[0]) == {"first": 100}
 
 
 def test_pull_request_comment_reactions_drills_deepest_first(rate_limit_mock_response, requests_mock):
     """Depth-first is the property that matters: a comment's remaining reactions are drained
-    before the pull request listing advances, so nothing is left behind when the sync ends."""
+    before the pull request's next reviews are read, so nothing is left behind."""
     _mock_repository_resolution(requests_mock)
-    listing = _deep_listing(
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1))
+    root = _pr_root(
+        "PR_1",
         [
-            _pr_with_reviews(
-                "PR_1",
-                [
-                    _pr_review(
-                        "PRR_1",
-                        11,
-                        [_pr_comment("PRRC_1", 21, [_reaction_node("REA_1", 301)], has_next=True, cursor="REACT_CUR")],
-                        has_next=True,
-                        cursor="COMMENT_CUR",
-                    )
-                ],
+            _pr_review(
+                "PRR_1",
+                11,
+                [_pr_comment("PRRC_1", 21, [_reaction_node("REA_1", 301)], has_next=True, cursor="REACT_CUR")],
                 has_next=True,
-                cursor="REVIEW_CUR",
+                cursor="COMMENT_CUR",
             )
         ],
-        has_next_page=True,
-        end_cursor="LIST_CUR",
+        has_next=True,
+        cursor="REVIEW_CUR",
     )
-    empty_comment = {
-        "data": {
-            "node": {
-                "__typename": "PullRequestReviewComment",
-                "node_id": "PRRC_1",
-                "id": 21,
-                "repository": {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}},
-                "reactions": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "totalCount": 0, "nodes": []},
-            }
-        }
-    }
-    empty_review = {
-        "data": {
-            "node": {
-                "__typename": "PullRequestReview",
-                "node_id": "PRR_1",
-                "id": 11,
-                "repository": {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}},
-                "comments": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "totalCount": 0, "nodes": []},
-            }
-        }
-    }
-    empty_pull_request = {
-        "data": {
-            "node": {
-                "__typename": "PullRequest",
-                "node_id": "PR_1",
-                "repository": {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}},
-                "reviews": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "totalCount": 0, "nodes": []},
-            }
-        }
-    }
     requests_mock.post(
         GRAPHQL_URL,
         [
-            {"json": listing},
-            {"json": empty_comment},
-            {"json": empty_review},
-            {"json": empty_pull_request},
-            {"json": _deep_listing([])},
+            {"json": root},
+            {"json": _deep_node("PullRequestReviewComment", _pr_comment("PRRC_1", 21, []))},
+            {"json": _deep_node("PullRequestReview", _pr_review("PRR_1", 11, []))},
+            {"json": _pr_root("PR_1", [])},
         ],
     )
 
@@ -1196,51 +1430,35 @@ def test_pull_request_comment_reactions_drills_deepest_first(rate_limit_mock_res
 
     assert error is None
     assert [record["id"] for record in records] == [301]
-    queries = [json.loads(request.body)["query"] for request in _graphql_requests(requests_mock)]
-    assert len(queries) == 5
-    # Reaction -> comment -> review -> pull request listing: deepest pending first.
-    assert 'node(id: "PRRC_1")' in queries[1]
-    assert 'node(id: "PRR_1")' in queries[2]
-    assert 'node(id: "PR_1")' in queries[3]
-    assert "pullRequests(" in queries[4]
-    cursors = [_variables(request).get("after") for request in _graphql_requests(requests_mock)]
-    assert cursors == [None, "REACT_CUR", "COMMENT_CUR", "REVIEW_CUR", "LIST_CUR"]
-
-
-def _deep_node(typename, node):
-    repository = {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}}
-    return {"data": {"node": {**node, "__typename": typename, "repository": repository}}}
+    assert _query_node_ids(requests_mock) == ["PR_1", "PRRC_1", "PRR_1", "PR_1"]
+    assert [_variables(request).get("after") for request in _graphql_requests(requests_mock)] == [None, "REACT_CUR", "COMMENT_CUR", "REVIEW_CUR"]
 
 
 @pytest.mark.parametrize(
-    ("listing_pull_request", "drilldown"),
+    ("root", "drilldown"),
     [
         pytest.param(
-            _pr_with_reviews("PR_1", [], has_next=True, cursor="REVIEW_CUR"),
-            _deep_node(
-                "PullRequest",
-                _pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_2", 302)])])]),
-            ),
+            _pr_root("PR_1", [], has_next=True, cursor="REVIEW_CUR"),
+            _pr_root("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_2", 302)])])]),
             id="pull_request",
         ),
         pytest.param(
-            _pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [], has_next=True, cursor="COMMENT_CUR")]),
+            _pr_root("PR_1", [_pr_review("PRR_1", 11, [], has_next=True, cursor="COMMENT_CUR")]),
             _deep_node("PullRequestReview", _pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_2", 302)])])),
             id="review",
         ),
         pytest.param(
-            _pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [], has_next=True, cursor="REACT_CUR")])]),
+            _pr_root("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [], has_next=True, cursor="REACT_CUR")])]),
             _deep_node("PullRequestReviewComment", _pr_comment("PRRC_1", 21, [_reaction_node("REA_2", 302)])),
             id="comment",
         ),
     ],
 )
-def test_pull_request_comment_reactions_reads_every_drilldown_root(
-    listing_pull_request, drilldown, rate_limit_mock_response, requests_mock
-):
+def test_pull_request_comment_reactions_reads_every_drilldown_root(root, drilldown, rate_limit_mock_response, requests_mock):
     """Each root the traversal re-roots at nests the comments at a different depth."""
     _mock_repository_resolution(requests_mock)
-    requests_mock.post(GRAPHQL_URL, [{"json": _deep_listing([listing_pull_request])}, {"json": drilldown}])
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1))
+    requests_mock.post(GRAPHQL_URL, [{"json": root}, {"json": drilldown}])
 
     records, error = _read(_config(), "pull_request_comment_reactions")
 
@@ -1251,17 +1469,16 @@ def test_pull_request_comment_reactions_reads_every_drilldown_root(
     assert record["comment_id"] == 21
     assert record["repository"] == REPOSITORY
     assert "original_record" not in record
+    assert set(_variables(_graphql_requests(requests_mock)[1])) == {"after", "first"}
 
 
 def test_pull_request_comment_reactions_sets_the_user_type_when_there_is_a_user(rate_limit_mock_response, requests_mock):
     """The legacy record carried `user.type`, which the `user` field of these documents does not return."""
     _mock_repository_resolution(requests_mock)
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1))
     with_user = {**_reaction_node("REA_1", 301), "user": {"node_id": "U_1", "id": 7, "login": "octocat"}}
     without_user = {**_reaction_node("REA_2", 302), "user": None}
-    requests_mock.post(
-        GRAPHQL_URL,
-        json=_deep_listing([_pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [with_user, without_user])])])]),
-    )
+    requests_mock.post(GRAPHQL_URL, json=_pr_root("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [with_user, without_user])])]))
 
     records, error = _read(_config(), "pull_request_comment_reactions")
 
@@ -1272,73 +1489,14 @@ def test_pull_request_comment_reactions_sets_the_user_type_when_there_is_a_user(
     }
 
 
-def test_pull_request_comment_reactions_omits_owner_and_name_on_drilldowns(rate_limit_mock_response, requests_mock):
-    """The drill-down documents root at `node(id:)` and declare no `$owner`/`$name`. GraphQL
-    rejects a document sent variables it does not declare, so they must not be sent."""
-    _mock_repository_resolution(requests_mock)
-    listing = _deep_listing(
-        [_pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [], has_next=True, cursor="REACT_CUR")])])]
-    )
-    empty_comment = {
-        "data": {
-            "node": {
-                "__typename": "PullRequestReviewComment",
-                "node_id": "PRRC_1",
-                "id": 21,
-                "repository": {"name": REPOSITORY.split("/")[1], "owner": {"login": REPOSITORY.split("/")[0]}},
-                "reactions": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "totalCount": 0, "nodes": []},
-            }
-        }
-    }
-    requests_mock.post(GRAPHQL_URL, [{"json": listing}, {"json": empty_comment}])
-
-    _read(_config(), "pull_request_comment_reactions")
-
-    requests = _graphql_requests(requests_mock)
-    assert set(_variables(requests[0])) == {"owner", "name", "first"}
-    assert set(_variables(requests[1])) == {"after", "first"}
-
-
-def test_pull_request_comment_reactions_keeps_owner_and_name_on_the_listing_continuation(rate_limit_mock_response, requests_mock):
-    """The pull request listing paginates like any other connection, and its continuation still
-    runs the repository document, which declares `$owner`/`$name`. Dropping them there made
-    GitHub answer `200` with `data: null` and `errors: [Variable $owner ... invalid value]`,
-    which the extractor reads as an empty page, so only the first `page_size` pull requests of a
-    repository were ever scanned for reactions -- silent data loss on any repository with more.
-    """
-    _mock_repository_resolution(requests_mock)
-    first_page = _deep_listing(
-        [_pr_with_reviews("PR_1", [_pr_review("PRR_1", 11, [_pr_comment("PRRC_1", 21, [_reaction_node("REA_1", 301)])])])],
-        has_next_page=True,
-        end_cursor="LIST_CUR",
-    )
-    second_page = _deep_listing(
-        [_pr_with_reviews("PR_2", [_pr_review("PRR_2", 12, [_pr_comment("PRRC_2", 22, [_reaction_node("REA_2", 302)])])])]
-    )
-    requests_mock.post(GRAPHQL_URL, [{"json": first_page}, {"json": second_page}])
-
-    records, error = _read(_config(), "pull_request_comment_reactions")
-
-    assert error is None
-    assert sorted(record["id"] for record in records) == [301, 302]
-    requests = _graphql_requests(requests_mock)
-    assert len(requests) == 2
-    assert "pullRequests(" in json.loads(requests[1].body)["query"]
-    assert _variables(requests[1]) == {
-        "owner": REPOSITORY.split("/")[0],
-        "name": REPOSITORY.split("/")[1],
-        "after": "LIST_CUR",
-        "first": 100,
-    }
-
-
 def test_pull_request_comment_reactions_reduces_the_page_size_on_gateway_timeout(rate_limit_mock_response, requests_mock):
     _mock_repository_resolution(requests_mock)
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1))
     requests_mock.post(
         GRAPHQL_URL,
         [
             {"status_code": 502, "json": {"message": "Bad Gateway"}},
-            {"json": _deep_listing([])},
+            {"json": _pr_root("PR_1", [])},
         ],
     )
 
@@ -1349,6 +1507,121 @@ def test_pull_request_comment_reactions_reduces_the_page_size_on_gateway_timeout
     assert [_variables(request)["first"] for request in _graphql_requests(requests_mock)] == [100, 50]
 
 
+def _respond_with_pr_root(request, context):
+    node_id = json.loads(request.body)["query"].split('node(id: "')[1].split('"')[0]
+    reaction = {"PR_1": _reaction_node("REA_1", 301), "PR_2": _reaction_node("REA_2", 302)}[node_id]
+    return _pr_root(node_id, [_pr_review(f"PRR_{node_id}", 11, [_pr_comment(f"PRRC_{node_id}", 21, [reaction])])])
+
+
+def test_pull_request_comment_reactions_second_sync_only_reads_pull_requests_updated_since(rate_limit_mock_response, requests_mock):
+    _mock_repository_resolution(requests_mock)
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1, "2022-05-01T00:00:00Z"))
+    requests_mock.post(GRAPHQL_URL, json=_respond_with_pr_root)
+
+    first, state = _incremental_read(_config(), "pull_request_comment_reactions")
+
+    assert [record["id"] for record in first] == [301]
+    assert state["parent_state"]["pull_requests"]
+
+    _mock_pull_requests(
+        requests_mock,
+        _pull_request("PR_0", 0, "2022-04-01T00:00:00Z"),
+        _pull_request("PR_1", 1, "2022-05-01T00:00:00Z"),
+        _pull_request("PR_2", 2, "2022-06-01T00:00:00Z"),
+    )
+    requests_mock.reset_mock()
+
+    second, _ = _incremental_read(_config(), "pull_request_comment_reactions", state=state)
+
+    assert 302 in [record["id"] for record in second]
+    # PR_1 sits on the cursor boundary, which the CDK re-reads; PR_0 predates it.
+    assert sorted(_query_node_ids(requests_mock)) == ["PR_1", "PR_2"]
+
+
+def test_pull_request_comment_reactions_full_scan_state_seeds_the_pull_requests_position(rate_limit_mock_response, requests_mock):
+    """The full-scan version's per-repository state must not turn the first incremental sync into
+    one query per pull request ever opened: pull requests older than the newest reaction it saw,
+    minus the margin, are not read."""
+    _mock_repository_resolution(requests_mock)
+    _mock_pull_requests(requests_mock, _pull_request("PR_1", 1, "2022-05-01T00:00:00Z"), _pull_request("PR_2", 2, "2022-06-01T00:00:00Z"))
+    requests_mock.post(GRAPHQL_URL, json=_respond_with_pr_root)
+    full_scan_state = {
+        "state": {"created_at": "2022-06-02T00:00:00Z"},
+        "states": [{"partition": {"repository": REPOSITORY}, "cursor": {"created_at": "2022-06-02T00:00:00Z"}}],
+        "parent_state": {},
+        "lookback_window": 50836,
+        "use_global_cursor": False,
+    }
+
+    records, state = _incremental_read(_config(), "pull_request_comment_reactions", state=full_scan_state)
+
+    assert [record["id"] for record in records] == [302]
+    assert _query_node_ids(requests_mock) == ["PR_2"]
+    assert state["use_global_cursor"] is True
+    assert state["parent_state"]["pull_requests"]
+
+
+@pytest.mark.parametrize(
+    ("stream_state", "expected"),
+    [
+        pytest.param(
+            {
+                "state": {"created_at": "2026-11-13T21:45:15Z"},
+                "states": [
+                    {"partition": {"repository": "org/a"}, "cursor": {"created_at": "2026-11-13T21:45:15Z"}},
+                    {"partition": {"repository": "org/b"}, "cursor": {"created_at": "1970-01-01T00:00:00Z"}},
+                ],
+                "parent_state": {},
+                "use_global_cursor": False,
+            },
+            {
+                "use_global_cursor": True,
+                "state": {"created_at": "2026-11-13T21:45:15Z"},
+                "parent_state": {
+                    "pull_requests": {
+                        "use_global_cursor": False,
+                        "state": {"updated_at": "2026-11-11T21:45:15Z"},
+                        "states": [
+                            {"partition": {"repository": "org/a"}, "cursor": {"updated_at": "2026-11-11T21:45:15Z"}},
+                            {"partition": {"repository": "org/b"}, "cursor": {"updated_at": "2026-11-11T21:45:15Z"}},
+                        ],
+                    }
+                },
+            },
+            id="per_partition",
+        ),
+        pytest.param(
+            {"org/a": {"created_at": "2022-06-03T00:00:00Z"}},
+            {
+                "use_global_cursor": True,
+                "state": {"created_at": "2022-06-03T00:00:00Z"},
+                "parent_state": {
+                    "pull_requests": {
+                        "use_global_cursor": False,
+                        "state": {"updated_at": "2022-06-01T00:00:00Z"},
+                        "states": [{"partition": {"repository": "org/a"}, "cursor": {"updated_at": "2022-06-01T00:00:00Z"}}],
+                    }
+                },
+            },
+            id="legacy",
+        ),
+        pytest.param(
+            {"states": [{"partition": {"repository": "org/a"}, "cursor": {"created_at": "1970-01-01T00:00:00Z"}}]},
+            {"use_global_cursor": True},
+            id="no_reaction_seen_reads_from_start_date",
+        ),
+    ],
+)
+def test_pull_request_comment_reactions_state_migration(stream_state, expected):
+    from components import PullRequestCommentReactionsStateMigration
+
+    migration = PullRequestCommentReactionsStateMigration(config={}, parameters={})
+
+    assert migration.should_migrate(stream_state)
+    assert migration.migrate(stream_state) == expected
+    assert not migration.should_migrate(expected) or "parent_state" not in expected
+
+
 # --- Default page size ------------------------------------------------------------------
 
 
@@ -1357,7 +1630,6 @@ def test_pull_request_comment_reactions_reduces_the_page_size_on_gateway_timeout
     [
         pytest.param("reviews", lambda: _reviews_listing([]), id="reviews"),
         pytest.param("issue_reactions", lambda: _issues_listing([]), id="issue_reactions"),
-        pytest.param("pull_request_comment_reactions", lambda: _deep_listing([]), id="pull_request_comment_reactions"),
     ],
 )
 def test_non_large_graphql_streams_use_the_default_page_size(stream_name, envelope, rate_limit_mock_response, requests_mock):
